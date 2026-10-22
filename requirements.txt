@@ -1,0 +1,5 @@
+# 작성: 2026-10-22 12:30 KST
+streamlit>=1.66
+requests>=2.32
+Pillow>=10.0
+pytest>=8.0

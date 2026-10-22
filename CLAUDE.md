@@ -6,29 +6,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 개요
 
-OpenRouter API 연동을 확인하는 작은 학습용 저장소다. 빌드·린트·테스트 설정은 없다.
+냉장고 사진에서 식재료를 인식하고 레시피를 추천하는 Streamlit 앱(OpenRouter 무료 모델 사용)이다. 단계별 PRD는 `docs/`에 있고, 현재 1단계(식재료 인식)까지 구현되어 있다. Streamlit Community Cloud 무료 배포를 전제로 한다.
 
-- `src/`: 코드. 현재는 단일 스크립트 `src/test_openrouter.py`뿐이다.
-- `docs/`: 문서. 냉장고 사진 레시피 앱의 단계별 PRD(`PRD_step1.md`~`PRD_step3.md`)가 있다.
-- 루트: `.env`(키, git 제외), `.env.example`, `.gitignore`, `CLAUDE.md`
+- `src/app.py`: Streamlit 화면(업로드·카메라, 결과 표 수정, 확정). 확정 목록은 `st.session_state["confirmed"]`.
+- `src/recognizer.py`: 화면과 무관한 인식 로직(이미지 검증·축소, OpenRouter 호출·재시도, JSON 파싱).
+- `src/test_openrouter.py`: API 연결을 확인하는 단발 스크립트.
+- `tests/`: 단위 테스트. `docs/`: PRD(`PRD_step1.md`~`PRD_step3.md`).
+- 루트: `.env`(키, git 제외), `.env.example`, `.streamlit/secrets.toml.example`, `requirements.txt`
 
-## 실행
+## 명령
 
 ```bash
-PYTHONIOENCODING=utf-8 python src/test_openrouter.py
+python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt   # 최초 1회
+.venv/Scripts/python -m streamlit run src/app.py                                   # 앱 실행
+.venv/Scripts/python -m pytest tests -q                                            # 전체 테스트
+.venv/Scripts/python -m pytest tests/test_recognizer.py -k parse -q                # 일부 테스트
+PYTHONIOENCODING=utf-8 .venv/Scripts/python src/test_openrouter.py                 # API 연결 확인
 ```
 
-- Windows 콘솔에서 한글이 깨지지 않도록 `PYTHONIOENCODING=utf-8`을 붙인다.
-- 의존성은 `requests`, `Pillow`이며 별도 requirements 파일은 없다. `python-dotenv`는 설치되어 있지 않다.
+- Windows 콘솔에서 한글이 깨지지 않도록 스크립트 실행 시 `PYTHONIOENCODING=utf-8`을 붙인다.
+- 테스트는 가짜 응답으로 동작하므로 네트워크·키가 필요 없다.
 
 ## 구조와 주의점
 
-- `src/test_openrouter.py`는 텍스트 호출과 이미지 호출을 한 번씩 보낸다. 모델은 파일 상단의 `TEXT_MODEL`, `IMAGE_MODEL` 상수로 바꾼다.
-  - 현재 텍스트: `nvidia/nemotron-3.5-lightning:free`
-  - 현재 이미지: `nvidia/nemotron-3.5-super-vl:free`
-- API 키는 프로젝트 루트 `.env`의 `OPENROUTER_API_KEY`에서 `load_key()`가 직접 파싱해 읽는다. `.env.example`은 값이 빈 템플릿이다. `.env`는 `.gitignore`로 제외된다. 키 값은 화면에 출력하지 않는다.
-- 이미지는 Pillow로 테스트 이미지(빨간 원, 파란 사각형, "HELLO 123")를 만들어 base64 data URL로 전송한다.
+- 모델: 이미지 `nvidia/nemotron-3.5-super-vl:free`(`recognizer.VISION_MODEL`), 텍스트(2단계 예정) `nvidia/nemotron-3.5-lightning:free`.
+- API 키 조회 순서: 앱은 `st.secrets` → 환경변수 → 프로젝트 루트 `.env`(`recognizer.get_api_key()`). 키 값은 화면·로그·오류 문구에 출력하지 않는다. `.env`와 `.streamlit/secrets.toml`은 git에서 제외된다.
+- 업로드 이미지는 검증 후 긴 변 1024px·약 300KB 이하 JPEG로 줄여(`prepare_image`) base64 data URL로 보낸다. 이미지는 저장하지 않는다. 업로드 한도 10MB는 `.streamlit/config.toml`의 `maxUploadSize`가 담당한다.
 - `max_tokens`는 2000이다. Nemotron VL 같은 추론형 모델은 답하기 전에 추론에 토큰을 많이 쓰므로, 300처럼 작게 잡으면 응답이 중간에 끊긴다.
+- 모델이 형식에 어긋나게 답하면 같은 모델에 1회 다시 요청한다. 429·5xx는 2초 뒤 한 번만 재시도하고, 그래도 실패하거나 모델이 없으면(403·404·410) `recognizer.FALLBACK_MODELS`를 차례로 시도한다. 401(키 문제)은 대체하지 않는다. 진입점은 `recognize_detailed()`이며 사용한 모델과 용량 변화를 함께 돌려준다. `tests/`가 검증한다.
+- `FALLBACK_MODELS`는 OpenRouter가 인기 순위를 API로 주지 않아 덜 알려진 순으로 직접 정한 목록이다. 모델 가용성이 바뀌면 `/api/v1/models`에서 `:free` + 이미지 입력 모델을 다시 조사해 갱신한다. `thinkingmachines/inkling*`는 agentic 전용이라 403이 난다.
+- 식재료가 아닌 단순 도형 이미지는 모델이 빈 목록을 돌려준다. 정상 동작이며 앱은 "찾지 못함" 안내를 보여 준다.
+- `st.camera_input`은 만들어 두기만 해도 페이지를 열 때 카메라 권한을 요청하므로 토글을 켰을 때만 만든다.
+- 요청 제한은 IP가 아니라 세션 기준이다(Streamlit에서 IP를 안정적으로 얻기 어려움).
+- 무료 배포 서버의 디스크는 영구 저장소가 아니다. 3단계 저장에는 외부 DB가 필요하다.
 
 ## 무료 모델 관련 알려진 동작
 
@@ -40,4 +50,4 @@ PYTHONIOENCODING=utf-8 python src/test_openrouter.py
 
 - 새 파일에는 KST(UTC+9) 기준 작성 일시를 주석으로 표시한다.
 - 저장소에 올라가는 텍스트(주석, 커밋 메시지, 문서)는 한국어로 쓴다.
-- `.gitignore`는 `.env`, `.env.*`(`.env.example` 제외), macOS의 `.DS_Store`를 제외한다.
+- `.gitignore`는 `.env`, `.env.*`(`.env.example` 제외), `.streamlit/secrets.toml`, `.venv/`, 캐시, macOS의 `.DS_Store`를 제외한다.

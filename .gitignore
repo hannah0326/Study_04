@@ -4,5 +4,13 @@
 .env.*
 !.env.example
 
+# 파이썬 가상환경·캐시
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Streamlit 비밀 설정(키 포함) — 예시 파일만 올린다
+.streamlit/secrets.toml
+
 # macOS 시스템 파일
 .DS_Store
