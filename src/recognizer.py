@@ -1,4 +1,4 @@
-# 작성: 2026-10-22 12:40 KST
+# 작성: 2026-10-22 12:22 KST
 # 1단계: 냉장고 사진에서 식재료를 인식한다. (화면과 분리된 순수 로직)
 import base64
 import io
@@ -11,14 +11,14 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
-VISION_MODEL = "nvidia/nemotron-3.5-super-vl:free"
+# 기본 모델: 2026-10-22 같은 이미지로 무료 이미지 모델들을 시험했을 때 가장 빨랐다(약 7초).
+VISION_MODEL = "minimax/minimax-m3.1-flash:free"
 # 기본 모델이 429 등으로 계속 실패하면 순서대로 시도한다.
-# OpenRouter 가 인기 순위를 API 로 주지 않아, 덜 알려진 모델 순으로 직접 정한 목록이다.
-# (2026-10-22 실제 이미지 호출로 동작 확인. inkling 계열은 agentic 전용이라 제외)
+# 제외한 모델: nemotron-3-nano-omni(175초로 너무 느림), inkling 계열(agentic 전용이라 403),
+# gemma-4(Google AI Studio 공유 풀 한도로 429가 계속됨)
 FALLBACK_MODELS = (
+    "nvidia/nemotron-3.5-super-vl:free",
     "dots-studio/dots-3-note-preview:free",
-    "minimax/minimax-m3.1-flash:free",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
 )
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024

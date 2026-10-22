@@ -1,4 +1,4 @@
-<!-- 작성: 2026-10-22 11:40 KST -->
+<!-- 작성: 2026-10-22 12:05 KST -->
 # PRD 1단계 — 냉장고 사진 식재료 인식
 
 > 전체 흐름: **1단계 식재료 인식** → [2단계 레시피 생성](PRD_step2.md) → [3단계 프로필·레시피 저장](PRD_step3.md)
@@ -30,7 +30,8 @@
 |---|---|
 | 앱 | Python + Streamlit (화면과 서버 로직이 한 프로세스) |
 | 배포 | Streamlit Community Cloud (무료) |
-| 모델 | `nvidia/nemotron-3.5-super-vl:free` |
+| 기본 모델 | `minimax/minimax-m3.1-flash:free` (무료 이미지 모델 시험에서 가장 빠름, 약 7초) |
+| 대체 모델 | `nvidia/nemotron-3.5-super-vl:free` → `dots-studio/dots-3-note-preview:free` |
 | 호출 | OpenRouter `https://openrouter.ai/api/v1/chat/completions` |
 | 이미지 전달 | base64 data URL (사전 테스트로 동작 확인됨) |
 
@@ -84,11 +85,14 @@ Streamlit 앱에는 별도 HTTP 엔드포인트가 없으므로, 로직을 화�
 
 ## 6. 모델 호출 시 유의점 (사전 테스트에서 확인된 사실)
 
-- 이 모델은 답변 전에 추론에 토큰을 많이 쓴다. `max_tokens`는 **2000 이상**으로 둔다. 300에서는 응답이 중간에 끊겼다.
+- 무료 이미지 모델은 대부분 답변 전에 추론에 토큰을 쓴다(minimax 약 200, nemotron-3.5-super-vl 약 1,000, dots는 2,000 이상). `max_tokens`는 **2000 이상**으로 둔다. nemotron-3.5-super-vl에서 300으로 두었을 때 응답이 중간에 끊겼다.
 - 무료 모델은 제공사 사정으로 429(속도 제한)·404가 날 수 있다.
   - 429(5xx 포함): 2초 뒤 한 번만 다시 시도한다.
   - 그래도 실패하면 대체 모델 목록(`recognizer.FALLBACK_MODELS`)을 순서대로 시도한다. 모델이 없거나(404) 사용 불가(403·410)인 경우도 다음 모델로 넘어간다. 대체 모델마다 같은 규칙(한 번 재시도)을 적용한다.
-  - 대체 모델 목록은 덜 알려진 무료 이미지 모델 순이다. OpenRouter가 인기 순위를 API로 제공하지 않아 직접 정했고, 실제 이미지 호출로 동작을 확인했다. (`dots-studio/dots-3-note-preview:free` → `minimax/minimax-m3.1-flash:free` → `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`) 모델 가용성은 수시로 바뀌므로 주기적으로 확인한다.
+  - 모델 순서는 같은 이미지로 무료 이미지 모델을 직접 시험해 정했다(2026-10-22). 기본 모델 `minimax/minimax-m3.1-flash:free`가 약 7초로 가장 빨랐고, 대체는 `nvidia/nemotron-3.5-super-vl:free`(약 19초), `dots-studio/dots-3-note-preview:free`(약 24초) 순이다. 시험은 모델당 1회라 편차가 있다.
+  - 제외한 모델: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`(175초로 너무 느림), `thinkingmachines/inkling*`(agentic 환경 전용이라 403), `google/gemma-4-*`(Google AI Studio 공유 풀 한도로 429가 계속됨).
+  - `dots-studio/dots-3-note-preview:free`는 답하기 전에 추론에 토큰을 많이 써서, `max_tokens`가 작으면 답이 잘려 JSON 파싱에 실패할 수 있다. 실제 사진에서 자주 실패하면 `max_tokens`를 늘리거나 목록에서 뺀다.
+  - 모델 가용성은 수시로 바뀌므로 주기적으로 다시 시험한다.
   - 대체 모델로 인식했으면 화면에 그 사실을 알리고 결과를 꼼꼼히 확인하도록 안내한다. 대체 모델의 정확도는 기본 모델과 다를 수 있다.
   - 모든 모델이 실패하면 "지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요"를 보여 준다.
   - 401은 서버 설정 문제이므로 사용자에게는 일반 오류 문구를, 서버 로그에는 원인을 남긴다. 키 값은 로그에 남기지 않는다.

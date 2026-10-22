@@ -1,4 +1,4 @@
-# 작성: 2026-10-22 11:00 KST
+# 작성: 2026-10-22 11:15 KST
 # OpenRouter API 동작 테스트: 텍스트 인식과 이미지 인식을 각각 호출한다.
 import base64
 import io
@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
 TEXT_MODEL = "nvidia/nemotron-3.5-lightning:free"
-IMAGE_MODEL = "nvidia/nemotron-3.5-super-vl:free"
+IMAGE_MODEL = "minimax/minimax-m3.1-flash:free"
 
 
 def load_key():
