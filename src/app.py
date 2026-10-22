@@ -35,6 +35,26 @@ def rate_limited():
     return False
 
 
+def describe_event(event):
+    """인식 진행 이벤트를 화면에 보일 한 줄로 바꾼다."""
+    kind = event["kind"]
+    if kind == "resize":
+        return f"📐 사진 축소: {event['original_bytes'] // 1024}KB → {event['sent_bytes'] // 1024}KB"
+    if kind == "request":
+        return f"📡 {event['model']} 요청 ({event['attempt']}차 시도)"
+    if kind == "retry":
+        return f"⏳ HTTP {event['status']} 요청 제한 — {event['wait']}초 뒤 다시 시도"
+    if kind == "parse_retry":
+        return f"🔁 {event['model']} 응답 형식 오류 — 다시 요청"
+    if kind == "fallback":
+        reason = "사용 불가" if event["unavailable"] else "요청 제한이 계속됨"
+        nxt = event["next_model"]
+        return f"🔀 {event['model']} {reason} → 대체 모델 {nxt}로 전환" if nxt else f"🔀 {event['model']} {reason} — 더 시도할 모델이 없음"
+    if kind == "done":
+        return f"✅ {event['model']} 인식 완료 ({event['count']}개)"
+    return str(event)
+
+
 def to_frame(items):
     return pd.DataFrame(
         [
@@ -70,6 +90,7 @@ source = uploaded or shot
 if source is not None:
     st.image(source, caption="미리보기", width=360)
 
+just_ran = False
 if st.button("식재료 인식", type="primary", disabled=source is None):
     st.session_state.pop("confirmed", None)
     st.session_state.pop("items", None)
@@ -77,15 +98,33 @@ if st.button("식재료 인식", type="primary", disabled=source is None):
     if rate_limited():
         st.warning("요청이 너무 잦습니다. 1분 뒤에 다시 시도해 주세요.")
     else:
+        log = []
+        st.session_state["progress_log"] = log
+        status = st.status("사진을 분석하는 중입니다. 최대 1~2분 걸릴 수 있어요.", expanded=True)
+
+        def on_event(event):
+            line = describe_event(event)
+            log.append(line)
+            status.write(line)
+
         try:
-            with st.spinner("사진을 분석하는 중입니다. 최대 1~2분 걸릴 수 있어요."):
-                result = recognizer.recognize_detailed(source.getvalue(), get_key())
+            result = recognizer.recognize_detailed(source.getvalue(), get_key(), on_event=on_event)
             st.session_state["items"] = result["items"]
             st.session_state["run_info"] = result
             st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+            status.update(label=f"인식 완료 ({len(result['items'])}개)", state="complete")
+            just_ran = True
         except recognizer.RecognitionError as e:
             st.session_state.pop("items", None)
+            log.append(f"❌ {e}")
+            status.update(label="인식 실패", state="error")
             st.error(str(e))
+
+# 새로 실행하지 않은 화면(표 수정 등)에서도 직전 진행 기록을 볼 수 있게 한다.
+if not just_ran and st.session_state.get("progress_log"):
+    with st.expander("진행 기록"):
+        for line in st.session_state["progress_log"]:
+            st.write(line)
 
 if "items" in st.session_state:
     items = st.session_state["items"]

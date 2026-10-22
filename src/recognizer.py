@@ -149,7 +149,13 @@ def parse_ingredients(text):
     return list(merged.values())
 
 
-def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, sleep=time.sleep):
+def _notify(on_event, kind, **info):
+    """진행 상황을 화면 등에 알린다. on_event 가 없으면 아무 일도 하지 않는다."""
+    if on_event:
+        on_event({"kind": kind, **info})
+
+
+def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, sleep=time.sleep, on_event=None):
     """비전 모델 하나를 호출하고 응답 텍스트를 돌려준다. 429·5xx 는 RETRY_DELAYS 만큼만 재시도한다."""
     data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode()
     body = {
@@ -167,6 +173,7 @@ def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, slee
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     for attempt in range(len(RETRY_DELAYS) + 1):
+        _notify(on_event, "request", model=model, attempt=attempt + 1)
         try:
             r = post(URL, headers=headers, json=body, timeout=TIMEOUT_SEC)
         except requests.Timeout:
@@ -180,6 +187,7 @@ def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, slee
                 raise ParseError("모델 응답을 해석하지 못했습니다.")
         if r.status_code == 429 or r.status_code >= 500:
             if attempt < len(RETRY_DELAYS):
+                _notify(on_event, "retry", model=model, status=r.status_code, wait=RETRY_DELAYS[attempt])
                 sleep(RETRY_DELAYS[attempt])
                 continue
             raise RateLimitedError("지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요.")
@@ -192,33 +200,43 @@ def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, slee
         raise RecognitionError(f"요청에 실패했습니다. (HTTP {r.status_code})")
 
 
-def _recognize_with_model(jpeg, api_key, model, post, sleep):
+def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
     """모델 하나로 인식한다. 응답 형식이 깨지면 같은 모델에 1회 다시 요청한다."""
     last_error = None
-    for _ in range(2):
+    for n in range(2):
+        if n:
+            _notify(on_event, "parse_retry", model=model)
         try:
-            return parse_ingredients(call_model(jpeg, api_key, model=model, post=post, sleep=sleep))
+            text = call_model(jpeg, api_key, model=model, post=post, sleep=sleep, on_event=on_event)
+            return parse_ingredients(text)
         except ParseError as e:
             last_error = e
     raise ParseError("모델 응답을 해석하지 못했습니다. 다시 시도해 주세요.") from last_error
 
 
-def recognize_detailed(raw_image, api_key, post=requests.post, sleep=time.sleep):
+def recognize_detailed(raw_image, api_key, post=requests.post, sleep=time.sleep, on_event=None):
     """업로드 바이트 → 결과 정보.
 
     기본 모델이 429·5xx(한 번 재시도 후)나 사용 불가로 실패하면 FALLBACK_MODELS 를 차례로 시도한다.
     돌려주는 값: items(식재료 목록), model(실제 사용한 모델), original_bytes, sent_bytes
+    on_event 를 주면 진행 상황(resize, request, retry, parse_retry, fallback, done)을 dict 로 알려 준다.
     """
     if not api_key:
         raise RecognitionError("서비스 설정에 문제가 있습니다. 관리자에게 문의해 주세요.")
     jpeg = prepare_image(raw_image)
+    _notify(on_event, "resize", original_bytes=len(raw_image), sent_bytes=len(jpeg))
+    models = (VISION_MODEL, *FALLBACK_MODELS)
     last_error = None
-    for model in (VISION_MODEL, *FALLBACK_MODELS):
+    for i, model in enumerate(models):
         try:
-            items = _recognize_with_model(jpeg, api_key, model, post, sleep)
+            items = _recognize_with_model(jpeg, api_key, model, post, sleep, on_event)
         except (RateLimitedError, ModelUnavailableError) as e:
             last_error = e
+            nxt = models[i + 1] if i + 1 < len(models) else None
+            _notify(on_event, "fallback", model=model, next_model=nxt,
+                    unavailable=isinstance(e, ModelUnavailableError))
             continue
+        _notify(on_event, "done", model=model, count=len(items))
         return {"items": items, "model": model, "original_bytes": len(raw_image), "sent_bytes": len(jpeg)}
     raise RateLimitedError(
         "지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요."

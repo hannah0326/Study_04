@@ -247,6 +247,25 @@ def test_recognize_detailed_reports_sizes():
     assert 0 < result["sent_bytes"] <= rec.TARGET_BYTES
 
 
+def test_events_report_resize_retry_fallback_done_in_order():
+    post = FakePost([FakeResponse(429), FakeResponse(429), FakeResponse(200, GOOD)])
+    events = []
+    rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None, on_event=events.append)
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["resize", "request", "retry", "request", "fallback", "request", "done"]
+    assert events[1]["model"] == rec.VISION_MODEL and events[1]["attempt"] == 1
+    assert events[2]["status"] == 429 and events[2]["wait"] == 2
+    assert events[3]["attempt"] == 2
+    assert events[4]["next_model"] == rec.FALLBACK_MODELS[0]
+    assert events[5]["model"] == rec.FALLBACK_MODELS[0]
+    assert events[6]["count"] == 1
+
+
+def test_events_not_required():
+    post = FakePost([FakeResponse(200, GOOD)])
+    assert rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)["items"]
+
+
 def test_recognize_without_key_does_not_call_api():
     post = FakePost([])
     with pytest.raises(rec.RecognitionError):
