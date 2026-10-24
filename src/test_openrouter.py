@@ -9,8 +9,8 @@ import requests
 from PIL import Image, ImageDraw
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
-TEXT_MODEL = "nvidia/nemotron-3.5-lightning:free"
-IMAGE_MODEL = "minimax/minimax-m3.1-flash:free"
+TEXT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+IMAGE_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 
 
 def load_key():

@@ -30,8 +30,8 @@
 |---|---|
 | 앱 | Python + Streamlit (화면과 서버 로직이 한 프로세스) |
 | 배포 | Streamlit Community Cloud (무료) |
-| 기본 모델 | `minimax/minimax-m3.1-flash:free` (무료 이미지 모델 시험에서 가장 빠름, 약 7초) |
-| 대체 모델 | `nvidia/nemotron-3.5-super-vl:free` → `dots-studio/dots-3-note-preview:free` |
+| 기본 모델 | `nvidia/nemotron-3.5-super-vl:free` (이미지·JSON 형식이 정확, 같은 이미지 시험에서 약 19초) |
+| 대체 모델 | `dots-studio/dots-3-note-preview:free` |
 | 호출 | OpenRouter `https://openrouter.ai/api/v1/chat/completions` |
 | 이미지 전달 | base64 data URL (사전 테스트로 동작 확인됨) |
 
@@ -89,8 +89,9 @@ Streamlit 앱에는 별도 HTTP 엔드포인트가 없으므로, 로직을 화�
 - 무료 모델은 제공사 사정으로 429(속도 제한)·404가 날 수 있다.
   - 429(5xx 포함): 2초 뒤 한 번만 다시 시도한다.
   - 그래도 실패하면 대체 모델 목록(`recognizer.FALLBACK_MODELS`)을 순서대로 시도한다. 모델이 없거나(404) 사용 불가(403·410)인 경우도 다음 모델로 넘어간다. 대체 모델마다 같은 규칙(한 번 재시도)을 적용한다.
-  - 모델 순서는 같은 이미지로 무료 이미지 모델을 직접 시험해 정했다(2026-10-22). 기본 모델 `minimax/minimax-m3.1-flash:free`가 약 7초로 가장 빨랐고, 대체는 `nvidia/nemotron-3.5-super-vl:free`(약 19초), `dots-studio/dots-3-note-preview:free`(약 24초) 순이다. 시험은 모델당 1회라 편차가 있다.
-  - 제외한 모델: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`(175초로 너무 느림), `thinkingmachines/inkling*`(agentic 환경 전용이라 403), `google/gemma-4-*`(Google AI Studio 공유 풀 한도로 429가 계속됨).
+  - 모델은 같은 이미지로 무료 이미지 모델을 직접 시험해 정했다(2026-10-22). 시험은 모델당 1회라 편차가 있다: minimax 약 7초, `nemotron-3.5-super-vl` 약 19초, `dots` 약 24초. 사용자가 직접 실제 냉장고 사진으로 시험했을 때는 약 40초가 걸렸고 정확도는 괜찮았다.
+  - **`minimax/minimax-m3.1-flash:free`는 속도가 가장 빨라 기본 모델로 정했었지만, 2026-10-22에 무료 기간이 끝나 `:free`가 404를 돌려준다(유료 버전은 요금이 나가므로 쓰지 않는다).** 그래서 기본을 `nemotron-3.5-super-vl`로 바꿨다. 같은 날 사용 불가 응답은 재시도 없이 대체 모델로 바로 넘어갔다.
+  - 제외한 모델: `minimax-m3.1-flash`(위 이유), `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`(175초로 너무 느림), `thinkingmachines/inkling*`(agentic 환경 전용이라 403), `google/gemma-4-*`(Google AI Studio 공유 풀 한도로 429가 계속됨).
   - `dots-studio/dots-3-note-preview:free`는 답하기 전에 추론에 토큰을 많이 써서, `max_tokens`가 작으면 답이 잘려 JSON 파싱에 실패할 수 있다. 실제 사진에서 자주 실패하면 `max_tokens`를 늘리거나 목록에서 뺀다.
   - 모델 가용성은 수시로 바뀌므로 주기적으로 다시 시험한다.
   - 대체 모델로 인식했으면 화면에 그 사실을 알리고 결과를 꼼꼼히 확인하도록 안내한다. 대체 모델의 정확도는 기본 모델과 다를 수 있다.

@@ -218,10 +218,22 @@ def test_no_fallback_when_primary_succeeds_after_one_retry():
     assert len(post.calls) == 2
 
 
-def test_fallback_skips_unavailable_model_and_walks_the_list():
+def test_fallback_skips_unavailable_primary_model_without_retrying_it():
+    # 기본 모델이 서비스를 끝내 404 를 주면 재시도하지 않고 바로 다음 모델로 넘어간다.
+    post = FakePost([FakeResponse(404), FakeResponse(200, GOOD)])
+    events = []
+    result = rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None, on_event=events.append)
+    assert models_used(post) == [rec.VISION_MODEL, rec.FALLBACK_MODELS[0]]
+    assert result["model"] == rec.FALLBACK_MODELS[0]
+    fb = [e for e in events if e["kind"] == "fallback"][0]
+    assert fb["unavailable"] is True and fb["reason"] == "unavailable"
+
+
+def test_fallback_walks_a_longer_list(monkeypatch):
+    monkeypatch.setattr(rec, "FALLBACK_MODELS", ("a/x:free", "b/y:free"))
     post = FakePost([FakeResponse(404), FakeResponse(429), FakeResponse(429), FakeResponse(200, GOOD)])
     result = rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)
-    assert result["model"] == rec.FALLBACK_MODELS[1]
+    assert result["model"] == "b/y:free"
 
 
 def test_all_models_rate_limited_gives_friendly_error():

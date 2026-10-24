@@ -2,24 +2,21 @@
 # 1단계: 냉장고 사진에서 식재료를 인식한다. (화면과 분리된 순수 로직)
 import base64
 import io
-import json
 import os
-import re
 import time
 
 import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-URL = "https://openrouter.ai/api/v1/chat/completions"
-# 기본 모델: 2026-10-22 같은 이미지로 무료 이미지 모델들을 시험했을 때 가장 빨랐다(약 7초).
-VISION_MODEL = "minimax/minimax-m3.1-flash:free"
+import llm
+
+URL = llm.URL
+# 기본 모델: 이미지와 JSON 형식이 정확하고 약 19초(2026-10-22, 같은 이미지로 시험, 실제 사진은 더 걸릴 수 있다).
+VISION_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 # 기본 모델이 429 등으로 계속 실패하면 순서대로 시도한다.
-# 제외한 모델: nemotron-3-nano-omni(175초로 너무 느림), inkling 계열(agentic 전용이라 403),
-# gemma-4(Google AI Studio 공유 풀 한도로 429가 계속됨)
-FALLBACK_MODELS = (
-    "nvidia/nemotron-3.5-super-vl:free",
-    "dots-studio/dots-3-note-preview:free",
-)
+# 제외한 모델: minimax-m3.1-flash(2026-10-22 무료 기간이 끝나 :free 가 404), nemotron-3-nano-omni(175초로 너무 느림),
+# inkling 계열(agentic 전용이라 403), gemma-4(Google AI Studio 공유 풀 한도로 429가 계속됨)
+FALLBACK_MODELS = ("dots-studio/dots-3-note-preview:free",)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 # 모델에 보내는 사진은 작게 줄인다. 한 변은 MAX_SIDE 이하, 용량은 TARGET_BYTES 안팎을 목표로 한다.
@@ -29,9 +26,9 @@ JPEG_QUALITIES = (85, 75, 65, 55)
 ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
 # 추론형 모델이라 작게 잡으면 응답이 중간에 끊긴다.
 MAX_TOKENS = 2000
-TIMEOUT_SEC = 120
-# 429·5xx 는 한 번만 더 시도하고, 그래도 안 되면 다음 모델로 넘어간다.
-RETRY_DELAYS = (2,)
+# 재시도·시간 제한은 llm.py 가 정한다(429·5xx 는 한 번만 더 시도하고 그래도 안 되면 다음 모델).
+TIMEOUT_SEC = llm.TIMEOUT_SEC
+RETRY_DELAYS = llm.RETRY_DELAYS
 
 CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -46,24 +43,15 @@ PROMPT = (
 )
 
 
-class RecognitionError(Exception):
-    """사용자에게 그대로 보여 줘도 되는 메시지를 담는 오류."""
+# 오류 클래스는 llm.py 와 같은 것을 가리킨다. 화면은 RecognitionError 하나로 이미지·레시피 오류를 모두 잡을 수 있다.
+RecognitionError = llm.ServiceError
+ParseError = llm.ParseError
+RateLimitedError = llm.RateLimitedError
+ModelUnavailableError = llm.ModelUnavailableError
 
 
 class ImageError(RecognitionError):
     pass
-
-
-class ParseError(RecognitionError):
-    pass
-
-
-class RateLimitedError(RecognitionError):
-    pass
-
-
-class ModelUnavailableError(RecognitionError):
-    """모델이 없거나(404) 이 키로 쓸 수 없는 경우(403·410 등). 다음 모델로 넘어갈 수 있다."""
 
 
 def get_api_key():
@@ -110,20 +98,9 @@ def prepare_image(raw):
     return buf.getvalue()
 
 
-def _extract_json(text):
-    text = re.sub(r"```(?:json)?", "", text or "")
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        raise ParseError("모델 응답에서 식재료 목록을 찾지 못했습니다.")
-    try:
-        return json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        raise ParseError("모델 응답 형식이 올바르지 않습니다.")
-
-
 def parse_ingredients(text):
     """모델 응답 텍스트를 검증하고 이름 기준으로 중복을 합친 목록으로 만든다."""
-    data = _extract_json(text)
+    data = llm.extract_json(text)
     items = data.get("ingredients") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise ParseError("모델 응답에 ingredients 목록이 없습니다.")
@@ -149,55 +126,19 @@ def parse_ingredients(text):
     return list(merged.values())
 
 
-def _notify(on_event, kind, **info):
-    """진행 상황을 화면 등에 알린다. on_event 가 없으면 아무 일도 하지 않는다."""
-    if on_event:
-        on_event({"kind": kind, **info})
-
-
 def call_model(jpeg_bytes, api_key, model=VISION_MODEL, post=requests.post, sleep=time.sleep, on_event=None):
-    """비전 모델 하나를 호출하고 응답 텍스트를 돌려준다. 429·5xx 는 RETRY_DELAYS 만큼만 재시도한다."""
+    """비전 모델 하나를 호출하고 응답 텍스트를 돌려준다. 429·5xx 는 llm.RETRY_DELAYS 만큼만 재시도한다."""
     data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode()
-    body = {
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
-    }
-    headers = {"Authorization": f"Bearer {api_key}"}
-    for attempt in range(len(RETRY_DELAYS) + 1):
-        _notify(on_event, "request", model=model, attempt=attempt + 1)
-        try:
-            r = post(URL, headers=headers, json=body, timeout=TIMEOUT_SEC)
-        except requests.Timeout:
-            raise RecognitionError("응답이 너무 오래 걸립니다. 잠시 후 다시 시도해 주세요.")
-        except requests.RequestException:
-            raise RecognitionError("서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.")
-        if r.status_code == 200:
-            try:
-                return r.json()["choices"][0]["message"]["content"]
-            except (ValueError, KeyError, IndexError, TypeError):
-                raise ParseError("모델 응답을 해석하지 못했습니다.")
-        if r.status_code == 429 or r.status_code >= 500:
-            if attempt < len(RETRY_DELAYS):
-                _notify(on_event, "retry", model=model, status=r.status_code, wait=RETRY_DELAYS[attempt])
-                sleep(RETRY_DELAYS[attempt])
-                continue
-            raise RateLimitedError("지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요.")
-        if r.status_code == 401:
-            # 키 설정 문제는 사용자에게 원인을 알리지 않는다. 같은 키라 다른 모델로 바꿔도 소용없다.
-            # 키 값은 어디에도 남기지 않는다.
-            raise RecognitionError("서비스 설정에 문제가 있습니다. 관리자에게 문의해 주세요.")
-        if r.status_code in (403, 404, 410):
-            raise ModelUnavailableError("선택한 모델을 지금 사용할 수 없습니다.")
-        raise RecognitionError(f"요청에 실패했습니다. (HTTP {r.status_code})")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    return llm.chat(model, messages, api_key, MAX_TOKENS, post=post, sleep=sleep, on_event=on_event)
 
 
 def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
@@ -205,7 +146,7 @@ def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
     last_error = None
     for n in range(2):
         if n:
-            _notify(on_event, "parse_retry", model=model)
+            llm.notify(on_event, "parse_retry", model=model)
         try:
             text = call_model(jpeg, api_key, model=model, post=post, sleep=sleep, on_event=on_event)
             return parse_ingredients(text)
@@ -224,23 +165,13 @@ def recognize_detailed(raw_image, api_key, post=requests.post, sleep=time.sleep,
     if not api_key:
         raise RecognitionError("서비스 설정에 문제가 있습니다. 관리자에게 문의해 주세요.")
     jpeg = prepare_image(raw_image)
-    _notify(on_event, "resize", original_bytes=len(raw_image), sent_bytes=len(jpeg))
+    llm.notify(on_event, "resize", original_bytes=len(raw_image), sent_bytes=len(jpeg))
     models = (VISION_MODEL, *FALLBACK_MODELS)
-    last_error = None
-    for i, model in enumerate(models):
-        try:
-            items = _recognize_with_model(jpeg, api_key, model, post, sleep, on_event)
-        except (RateLimitedError, ModelUnavailableError) as e:
-            last_error = e
-            nxt = models[i + 1] if i + 1 < len(models) else None
-            _notify(on_event, "fallback", model=model, next_model=nxt,
-                    unavailable=isinstance(e, ModelUnavailableError))
-            continue
-        _notify(on_event, "done", model=model, count=len(items))
-        return {"items": items, "model": model, "original_bytes": len(raw_image), "sent_bytes": len(jpeg)}
-    raise RateLimitedError(
-        "지금 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요."
-    ) from last_error
+    model, items = llm.run_with_fallback(
+        models, lambda m: _recognize_with_model(jpeg, api_key, m, post, sleep, on_event), on_event
+    )
+    llm.notify(on_event, "done", model=model, count=len(items))
+    return {"items": items, "model": model, "original_bytes": len(raw_image), "sent_bytes": len(jpeg)}
 
 
 def recognize(raw_image, api_key, post=requests.post, sleep=time.sleep):
