@@ -16,7 +16,7 @@ CONFIRMED = [{"name": "달걀", "quantity": "6개", "confidence": "high"}, {"nam
 
 
 def fake_recipe(title="달걀 볶음", **kw):
-    r = {"title": title, "summary": "간단한 요리", "servings": 2, "time_minutes": 20, "difficulty": "easy",
+    r = {"title": title, "summary": "간단한 요리", "cuisine": "한식", "servings": 2, "time_minutes": 20, "difficulty": "easy",
          "ingredients": [{"name": "달걀", "amount": "2개", "have": True}, {"name": "대파", "amount": "1대", "have": False}],
          "missing": ["대파"], "steps": ["볶는다.", "담는다."]}
     r.update(kw)
@@ -56,7 +56,9 @@ def test_options_and_safety_notice_are_shown(app):
     app.run()
     assert not app.exception
     assert [n.label for n in app.number_input] == ["인원수"]
-    assert {s.label for s in app.selectbox} >= {"최대 조리 시간"}
+    assert [s.label for s in app.selectbox] == ["요리 종류", "난이도", "조리 시간"]
+    assert [s.value for s in app.selectbox] == [None, None, "제한 없음"]      # 기본은 모두 제한 없음
+    assert app.selectbox[2].options == ["제한 없음", "15분 이내", "30분 이내", "30분 이상"]   # 60분 이내는 없다
     assert [m.label for m in app.multiselect] == ["알레르기", "식단 제한"]
     assert app.radio[0].value == "소량" and app.slider[0].value == 3
     assert "직접 꼭 확인" in texts(app)          # 알레르기 고지는 항상 보인다
@@ -87,6 +89,32 @@ def test_generate_passes_chosen_options_and_shows_cards(app, monkeypatch):
     assert button(app, "다시 생성")              # 결과가 있으면 단추 이름이 바뀐다
 
 
+def test_cuisine_difficulty_and_time_choices_reach_the_generator(app, monkeypatch):
+    seen = {}
+
+    def fake(ingredients, options, key, on_event=None, **kw):
+        seen["options"] = options
+        return fake_result()
+
+    monkeypatch.setattr(recipe, "generate_recipes", fake)
+    app.run()
+    assert app.selectbox[0].options == ["제한 없음", "한식", "양식", "중식", "일식"]
+    assert app.selectbox[1].options == ["제한 없음", "초급", "중급", "고급"]
+    app.selectbox[0].set_value("중식")
+    app.selectbox[1].set_value("hard")
+    app.selectbox[2].set_value("30분 이상")
+    button(app, "레시피 생성").click().run()
+    assert not app.exception
+    o = seen["options"]
+    assert (o["cuisine"], o["difficulty"]) == ("중식", "hard")
+    assert (o["min_minutes"], o["max_minutes"]) == (30, None)         # "이상"은 최소 시간
+    # "이내"는 최대 시간으로 간다
+    app.selectbox[2].set_value("15분 이내")
+    button(app, "다시 생성").click().run()
+    assert (seen["options"]["min_minutes"], seen["options"]["max_minutes"]) == (None, 15)
+    assert "한식 · ⏱ 20분 · 초급" in texts(app)                      # 카드에 요리 종류·난이도 이름이 보인다
+
+
 def test_failure_is_shown_honestly_and_clears_the_previous_result(app, monkeypatch):
     app.session_state["recipe_result"] = fake_result(fake_recipe("옛 레시피"))
 
@@ -101,6 +129,59 @@ def test_failure_is_shown_honestly_and_clears_the_previous_result(app, monkeypat
     assert "recipe_result" not in app.session_state          # 이전 결과를 이번 결과처럼 보이지 않게 한다
     assert "옛 레시피" not in texts(app)
     assert any("레시피 생성에 실패했어요" in e.value for e in app.error)
+
+
+def test_daily_limit_message_is_shown_as_is_and_not_as_a_busy_message(app, monkeypatch):
+    def boom(*a, on_event=None, **k):
+        on_event({"kind": "daily_limit", "model": "m/a", "reset": "한국 시각 10월 23일 오전 9시"})
+        raise llm.DailyLimitError(50, 1792713600000)
+
+    monkeypatch.setattr(recipe, "generate_recipes", boom)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    assert not app.exception
+    shown = " ".join(e.value for e in app.error)
+    assert "무료 호출 50회를 모두 사용했어요" in shown and "10월 23일 오전 9시" in shown
+    assert "잠시 후 다시" not in shown
+    assert any("하루 무료 호출 한도" in line for line in app.session_state["recipe_log"])
+
+
+def test_all_models_gone_message_is_shown(app, monkeypatch):
+    def boom(*a, **k):
+        raise llm.AllModelsUnavailableError(llm.MSG_ALL_UNAVAILABLE)
+
+    monkeypatch.setattr(recipe, "generate_recipes", boom)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    shown = " ".join(e.value for e in app.error)
+    assert "모두 사용할 수 없어요" in shown and "잠시 후" not in shown
+
+
+def test_progress_log_shows_response_time_bad_format_cause_and_total_time(app, monkeypatch):
+    def fake(ingredients, options, key, on_event=None, **kw):
+        on_event({"kind": "request", "model": "m/a", "attempt": 1})
+        on_event({"kind": "response", "model": "m/a", "status": 200, "seconds": 12.3})
+        on_event({"kind": "parse_retry", "model": "m/a", "cause": "모델이 빈 응답을 보냈습니다.", "snippet": ""})
+        on_event({"kind": "parse_retry", "model": "m/a", "cause": "모델 응답에서 JSON 을 찾지 못했습니다.", "snippet": "죄송합니다"})
+        return fake_result()
+
+    monkeypatch.setattr(recipe, "generate_recipes", fake)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    log = app.session_state["recipe_log"]
+    assert "↳ 200 응답 (12.3초)" in log
+    assert any("원인: 모델이 빈 응답을 보냈습니다" in line for line in log)
+    assert any("응답 앞부분 “죄송합니다”" in line for line in log)
+    assert log[-1].startswith("⏱ 총 ") and log[-1].endswith("초")
+
+
+def test_partial_result_explains_why_it_stopped(app, monkeypatch):
+    res = fake_result(requested=3)
+    res["note"] = "나머지 레시피는 받지 못했어요. 오늘 쓸 수 있는 무료 호출 50회를 모두 사용했어요."
+    monkeypatch.setattr(recipe, "generate_recipes", lambda *a, **k: res)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    assert any("나머지 레시피는 받지 못했어요" in w.value for w in app.warning)
 
 
 def test_model_output_is_not_rendered_as_markdown_links(app, monkeypatch):

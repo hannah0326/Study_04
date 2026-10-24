@@ -264,13 +264,51 @@ def test_events_report_resize_retry_fallback_done_in_order():
     events = []
     rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None, on_event=events.append)
     kinds = [e["kind"] for e in events]
-    assert kinds == ["resize", "request", "retry", "request", "fallback", "request", "done"]
+    # 요청마다 응답(상태·걸린 시간)이 따라온다
+    assert kinds == ["resize", "request", "response", "retry", "request", "response", "fallback",
+                     "request", "response", "done"]
     assert events[1]["model"] == rec.VISION_MODEL and events[1]["attempt"] == 1
-    assert events[2]["status"] == 429 and events[2]["wait"] == 2
-    assert events[3]["attempt"] == 2
-    assert events[4]["next_model"] == rec.FALLBACK_MODELS[0]
-    assert events[5]["model"] == rec.FALLBACK_MODELS[0]
-    assert events[6]["count"] == 1
+    assert events[2]["status"] == 429 and events[2]["seconds"] >= 0
+    assert events[3]["status"] == 429 and events[3]["wait"] == 2
+    assert events[4]["attempt"] == 2
+    assert events[6]["next_model"] == rec.FALLBACK_MODELS[0]
+    assert events[7]["model"] == rec.FALLBACK_MODELS[0]
+    assert events[8]["status"] == 200
+    assert events[9]["count"] == 1
+
+
+def test_parse_retry_event_tells_why_the_first_answer_was_unusable():
+    post = FakePost([FakeResponse(200, "죄송하지만 알 수 없습니다"), FakeResponse(200, GOOD)])
+    events = []
+    rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None, on_event=events.append)
+    retry = [e for e in events if e["kind"] == "parse_retry"][0]
+    assert "JSON" in retry["cause"] and retry["snippet"].startswith("죄송하지만")
+
+
+class DailyLimitResponse:
+    status_code = 429
+    headers = {"X-RateLimit-Limit": "50", "X-RateLimit-Reset": "1792713600000"}
+
+    def json(self):
+        return {"error": {"message": "Rate limit exceeded: free-models-per-day", "code": 429,
+                          "metadata": {"limit_source": "openrouter_free_tier_daily"}}}
+
+
+def test_image_daily_limit_gives_the_exact_reason_and_does_not_try_other_models():
+    post = FakePost([DailyLimitResponse()])
+    with pytest.raises(rec.RateLimitedError) as e:
+        rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)
+    msg = str(e.value)
+    assert "50회" in msg and "10월 23일 오전 9시" in msg and "잠시 후" not in msg
+    assert len(post.calls) == 1                         # 대체 모델도 같은 한도라 시도하지 않는다
+
+
+def test_image_all_models_gone_says_models_are_unavailable():
+    n = 1 + len(rec.FALLBACK_MODELS)
+    post = FakePost([FakeResponse(404)] * n)
+    with pytest.raises(rec.RecognitionError) as e:
+        rec.recognize_detailed(make_image(), "K", post=post, sleep=lambda s: None)
+    assert "모두 사용할 수 없" in str(e.value) and "잠시 후" not in str(e.value)
 
 
 def test_events_not_required():

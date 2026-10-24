@@ -103,7 +103,7 @@ def parse_ingredients(text):
     data = llm.extract_json(text)
     items = data.get("ingredients") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        raise ParseError("모델 응답에 ingredients 목록이 없습니다.")
+        raise ParseError("모델 응답에 ingredients 목록이 없습니다.", llm.snippet(text))
     merged = {}
     for item in items:
         if not isinstance(item, dict):
@@ -145,8 +145,8 @@ def _recognize_with_model(jpeg, api_key, model, post, sleep, on_event=None):
     """모델 하나로 인식한다. 응답 형식이 깨지면 같은 모델에 1회 다시 요청한다."""
     last_error = None
     for n in range(2):
-        if n:
-            llm.notify(on_event, "parse_retry", model=model)
+        if n:  # 첫 응답이 형식 오류였다. 무엇이 문제였는지 함께 알린다.
+            llm.notify(on_event, "parse_retry", model=model, cause=str(last_error), snippet=getattr(last_error, "snippet", ""))
         try:
             text = call_model(jpeg, api_key, model=model, post=post, sleep=sleep, on_event=on_event)
             return parse_ingredients(text)

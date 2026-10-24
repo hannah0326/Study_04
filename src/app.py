@@ -36,6 +36,34 @@ def rate_limited():
     return False
 
 
+def cause_text(event):
+    """형식 오류의 원인(어떤 문제였는지와 응답 앞부분)을 한 줄로 만든다. 모델 글자라서 이스케이프한다."""
+    text = md_safe(event.get("cause") or "알 수 없음")
+    if event.get("snippet"):
+        text += f", 응답 앞부분 “{md_safe(event['snippet'])}”"
+    return text
+
+
+def start_progress(title, log):
+    """진행 상자를 만들고, 이벤트를 한 줄씩 기록하는 함수와 끝내는 함수를 돌려준다. 총 소요 시간도 남긴다."""
+    status = st.status(title, expanded=True)
+    started = time.time()
+
+    def on_event(event):
+        line = describe_event(event)
+        log.append(line)
+        status.write(line)
+
+    def finish(label, state):
+        seconds = time.time() - started
+        line = f"⏱ 총 {seconds:.1f}초"
+        log.append(line)
+        status.write(line)
+        status.update(label=f"{label} · {seconds:.0f}초", state=state)
+
+    return on_event, finish
+
+
 def describe_event(event):
     """인식 진행 이벤트를 화면에 보일 한 줄로 바꾼다."""
     kind = event["kind"]
@@ -43,12 +71,17 @@ def describe_event(event):
         return f"📐 사진 축소: {event['original_bytes'] // 1024}KB → {event['sent_bytes'] // 1024}KB"
     if kind == "request":
         return f"📡 {event['model']} 요청 ({event['attempt']}차 시도)"
+    if kind == "response":
+        return f"↳ {event['status']} 응답 ({event['seconds']}초)"
     if kind == "retry":
         return f"⏳ HTTP {event['status']} 요청 제한 — {event['wait']}초 뒤 다시 시도"
     if kind == "parse_retry":
-        return f"🔁 {event['model']} 응답 형식 오류 — 다시 요청"
+        return f"🔁 {event['model']} 응답 형식 오류 — 다시 요청 (원인: {cause_text(event)})"
+    if kind == "daily_limit":
+        return (f"⛔ 하루 무료 호출 한도를 모두 썼어요 — 다른 모델도 같은 한도를 쓰므로 더 시도하지 않습니다 "
+                f"({event['reset']}에 초기화)")
     if kind == "fallback":
-        reason = {"unavailable": "사용 불가", "parse": "응답 형식 오류가 계속됨"}.get(
+        reason = {"unavailable": "사용 불가", "parse": f"응답 형식 오류가 계속됨 (원인: {cause_text(event)})"}.get(
             event.get("reason"), "요청 제한이 계속됨"
         )
         nxt = event["next_model"]
@@ -75,7 +108,9 @@ def add_row():
     st.session_state["next_id"] = row_id + 1
 
 
-DIFFICULTY_LABEL = {"easy": "쉬움", "medium": "보통", "hard": "어려움"}
+DIFFICULTY_LABEL = recipe.DIFFICULTY_KO  # easy/medium/hard → 초급/중급/고급
+# 조리 시간 선택지: (이름, 최소 분, 최대 분). "이상"은 최소 시간, "이내"는 최대 시간이다.
+TIME_CHOICES = (("제한 없음", None, None), ("15분 이내", None, 15), ("30분 이내", None, 30), ("30분 이상", 30, None))
 RECIPE_STATE_KEYS = ("recipe_result", "recipe_error", "recipe_log")
 
 
@@ -92,11 +127,13 @@ def md_safe(text):
 
 def recipe_options():
     """레시피 조건 입력 위젯을 그리고 선택값을 돌려준다."""
-    st.number_input("인원수", min_value=1, max_value=10, value=2, step=1, key="opt_servings")
+    st.selectbox("요리 종류", [None, *recipe.CUISINES], format_func=lambda v: "제한 없음" if v is None else v, key="opt_cuisine")
     st.selectbox(
-        "최대 조리 시간", [None, 15, 30, 60],
-        format_func=lambda v: "제한 없음" if v is None else f"{v}분 이내", key="opt_time",
+        "난이도", [None, *recipe.DIFFICULTIES],
+        format_func=lambda v: "제한 없음" if v is None else DIFFICULTY_LABEL[v], key="opt_difficulty",
     )
+    st.selectbox("조리 시간", [c[0] for c in TIME_CHOICES], key="opt_time")
+    st.number_input("인원수", min_value=1, max_value=10, value=2, step=1, key="opt_servings")
     st.multiselect(
         "알레르기", list(recipe.ALLERGEN_TERMS), accept_new_options=True, key="opt_allergies",
         placeholder="없음 (직접 입력도 가능)",
@@ -109,9 +146,13 @@ def recipe_options():
         help="불가: 가진 재료만 / 소량: 소금·간장 같은 기본 양념류만 / 허용: 자유롭게",
     )
     st.slider("추천 개수", 1, 5, 3, key="opt_count")
+    _, min_minutes, max_minutes = next(c for c in TIME_CHOICES if c[0] == st.session_state["opt_time"])
     return {
+        "cuisine": st.session_state["opt_cuisine"],
+        "difficulty": st.session_state["opt_difficulty"],
         "servings": st.session_state["opt_servings"],
-        "max_minutes": st.session_state["opt_time"],
+        "min_minutes": min_minutes,
+        "max_minutes": max_minutes,
         "allergies": st.session_state["opt_allergies"],
         "restrictions": st.session_state["opt_diet"],
         "extra": st.session_state["opt_extra"],
@@ -127,22 +168,16 @@ def generate_recipes_clicked(confirmed, options):
         return
     log = []
     st.session_state["recipe_log"] = log
-    status = st.status("레시피를 만드는 중입니다. 최대 1~2분 걸릴 수 있어요.", expanded=True)
-
-    def on_event(event):
-        line = describe_event(event)
-        log.append(line)
-        status.write(line)
-
+    on_event, finish = start_progress("레시피를 만드는 중입니다. 최대 1~2분 걸릴 수 있어요.", log)
     try:
         result = recipe.generate_recipes(confirmed, options, get_key(), on_event=on_event)
     except llm.ServiceError as e:
         log.append(f"❌ {e}")
         st.session_state["recipe_error"] = str(e)
-        status.update(label="레시피 생성 실패", state="error")
+        finish("레시피 생성 실패", "error")
     else:
         st.session_state["recipe_result"] = result
-        status.update(label=f"레시피 {len(result['recipes'])}개 완료", state="complete")
+        finish(f"레시피 {len(result['recipes'])}개 완료", "complete")
     # 단추 이름("다시 생성")과 결과·진행 기록을 한 번에 새로 그린다. 진행 기록은 접힌 영역에 남는다.
     st.rerun()
 
@@ -156,11 +191,14 @@ def render_recipes(result):
         st.warning("조건에 맞는 레시피가 없어요. 조건을 완화하고 다시 생성해 보세요.")
     elif len(recipes) < result["requested"]:
         st.caption(f"요청한 {result['requested']}개 중 {len(recipes)}개만 조건에 맞았어요.")
+    if result.get("note"):  # 하루 한도 소진 등으로 일부만 받고 멈춘 이유
+        st.warning(md_safe(result["note"]))
     for i, r in enumerate(recipes):
         with st.container(border=True):
             st.markdown(f"**{i + 1}. {md_safe(r['title'])}**")
             lack = "부족한 재료 없음" if not r["missing"] else f"부족한 재료 {len(r['missing'])}개"
-            st.caption(f"⏱ {r['time_minutes']}분 · {DIFFICULTY_LABEL[r['difficulty']]} · {r['servings']}인분 · {lack}")
+            kind = f"{r['cuisine']} · " if r.get("cuisine") else ""
+            st.caption(f"{kind}⏱ {r['time_minutes']}분 · {DIFFICULTY_LABEL[r['difficulty']]} · {r['servings']}인분 · {lack}")
             if r["summary"]:
                 st.write(md_safe(r["summary"]))
             if r["missing"]:
@@ -231,12 +269,7 @@ if st.button("식재료 인식", type="primary", disabled=source is None):
     else:
         log = []
         st.session_state["progress_log"] = log
-        status = st.status("사진을 분석하는 중입니다. 최대 1~2분 걸릴 수 있어요.", expanded=True)
-
-        def on_event(event):
-            line = describe_event(event)
-            log.append(line)
-            status.write(line)
+        on_event, finish = start_progress("사진을 분석하는 중입니다. 최대 1~2분 걸릴 수 있어요.", log)
 
         try:
             result = recognizer.recognize_detailed(source.getvalue(), get_key(), on_event=on_event)
@@ -246,12 +279,12 @@ if st.button("식재료 인식", type="primary", disabled=source is None):
             )
             st.session_state["rows"] = new_rows
             st.session_state["run_info"] = result
-            status.update(label=f"인식 완료 ({len(result['items'])}개)", state="complete")
+            finish(f"인식 완료 ({len(result['items'])}개)", "complete")
             just_ran = True
         except recognizer.RecognitionError as e:
             st.session_state.pop("rows", None)
             log.append(f"❌ {e}")
-            status.update(label="인식 실패", state="error")
+            finish("인식 실패", "error")
             st.error(str(e))
 
 # 새로 실행하지 않은 화면(표 수정 등)에서도 직전 진행 기록을 볼 수 있게 한다.

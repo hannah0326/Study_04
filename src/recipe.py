@@ -32,9 +32,16 @@ MAX_TEXT_LEN = 30
 MAX_LIST_ITEMS = 10
 
 EXTRA_CHOICES = ("불가", "소량", "허용")
-TIME_CHOICES = (None, 15, 30, 60)
+# 조리 시간 선택지: 제한 없음 / 15분 이내 / 30분 이내 / 30분 이상 (이상은 최소 시간)
+MAX_MINUTES_CHOICES = (None, 15, 30)
+MIN_MINUTES_CHOICES = (None, 30)
+CUISINES = ("한식", "양식", "중식", "일식")
 DIFFICULTIES = ("easy", "medium", "hard")
-DEFAULT_OPTIONS = {"servings": 2, "max_minutes": None, "restrictions": [], "allergies": [], "extra": "소량", "count": 3}
+DIFFICULTY_KO = {"easy": "초급", "medium": "중급", "hard": "고급"}
+DEFAULT_OPTIONS = {
+    "servings": 2, "max_minutes": None, "min_minutes": None, "cuisine": None, "difficulty": None,
+    "restrictions": [], "allergies": [], "extra": "소량", "count": 3,
+}
 
 SYSTEM_PROMPT = (
     "당신은 한국 가정 요리 도우미입니다. 사용자가 가진 재료로 만들 수 있는 레시피를 추천합니다.\n"
@@ -44,11 +51,12 @@ SYSTEM_PROMPT = (
     "- 알레르기와 식단 제한에 걸리는 재료는 절대 쓰지 마세요.\n"
     "- 추가 재료 정책: 불가=가진 재료만 사용, 소량=소금·간장·식용유 같은 기본 양념류만 추가 가능, 허용=자유롭게 추가 가능.\n"
     "- ingredients 의 have 는 사용자가 가진 재료이면 true, 아니면 false 입니다. missing 은 가지고 있지 않은 재료 이름 목록입니다.\n"
-    "- 조리 시간은 분 단위 정수, 인원수는 정수로 쓰고, 최대 조리 시간이 있으면 지키세요.\n"
-    "- difficulty 는 easy, medium, hard 중 하나입니다.\n"
+    "- 조리 시간은 분 단위 정수, 인원수는 정수로 쓰세요. 최대 조리 시간이 있으면 그 안에, 최소 조리 시간이 있으면 그 이상 걸리는 레시피만 쓰세요.\n"
+    "- 요리 종류가 지정되면 그 종류의 레시피만, 난이도가 지정되면 그 난이도의 레시피만 쓰세요. cuisine 은 한식, 양식, 중식, 일식 중 하나로 적으세요.\n"
+    "- difficulty 는 easy(초급), medium(중급), hard(고급) 중 하나입니다.\n"
     "- 안전하지 않은 조리법(익히지 않은 닭고기 등)은 쓰지 마세요.\n"
     "- 아래 JSON 형식으로만 답하고, 다른 설명이나 코드 블록 표시는 쓰지 마세요.\n"
-    '{"recipes":[{"title":"","summary":"","servings":2,"time_minutes":20,"difficulty":"easy",'
+    '{"recipes":[{"title":"","summary":"","cuisine":"한식","servings":2,"time_minutes":20,"difficulty":"easy",'
     '"ingredients":[{"name":"","amount":"","have":true}],"missing":[""],"steps":[""]}]}'
 )
 
@@ -139,10 +147,16 @@ def _clean_list(values):
 def normalize_options(raw):
     """화면에서 받은 조건을 허용 범위로 맞춘다. 알 수 없는 값은 기본값을 쓴다."""
     raw = raw or {}
-    max_minutes = raw.get("max_minutes")
+    max_minutes = raw.get("max_minutes") if raw.get("max_minutes") in MAX_MINUTES_CHOICES else None
+    min_minutes = raw.get("min_minutes") if raw.get("min_minutes") in MIN_MINUTES_CHOICES else None
+    if max_minutes and min_minutes:  # "이내"와 "이상"은 함께 고를 수 없다. 최대 시간을 우선한다.
+        min_minutes = None
     return {
         "servings": _clamp_int(raw.get("servings"), 1, 10, DEFAULT_OPTIONS["servings"]),
-        "max_minutes": max_minutes if max_minutes in TIME_CHOICES else None,
+        "max_minutes": max_minutes,
+        "min_minutes": min_minutes,
+        "cuisine": raw.get("cuisine") if raw.get("cuisine") in CUISINES else None,
+        "difficulty": raw.get("difficulty") if raw.get("difficulty") in DIFFICULTIES else None,
         "restrictions": _clean_list(raw.get("restrictions")),
         "allergies": _clean_list(raw.get("allergies")),
         "extra": raw.get("extra") if raw.get("extra") in EXTRA_CHOICES else DEFAULT_OPTIONS["extra"],
@@ -155,7 +169,10 @@ def build_messages(ingredients, options, count, exclude_titles=()):
     data = {
         "가진_재료": ingredients,
         "인원수": options["servings"],
+        "요리_종류": options["cuisine"],
+        "난이도": DIFFICULTY_KO.get(options["difficulty"]),
         "최대_조리시간_분": options["max_minutes"],
+        "최소_조리시간_분": options["min_minutes"],
         "식단_제한": options["restrictions"],
         "알레르기": options["allergies"],
         "추가_재료_정책": options["extra"],
@@ -183,6 +200,18 @@ def _to_int(value):
 
 
 _DIFFICULTY_WORDS = {"쉬움": "easy", "초급": "easy", "보통": "medium", "중급": "medium", "어려움": "hard", "고급": "hard"}
+# 모델이 cuisine 을 영어나 다른 말로 줘도 한식·양식·중식·일식으로 맞춘다. 알 수 없으면 빈 문자열(확인 불가)이다.
+_CUISINE_WORDS = {
+    "korean": "한식", "한국": "한식", "한국요리": "한식", "한국음식": "한식",
+    "western": "양식", "서양": "양식", "서양식": "양식", "이탈리안": "양식", "프렌치": "양식", "italian": "양식", "french": "양식",
+    "chinese": "중식", "중국": "중식", "중국요리": "중식", "중화": "중식",
+    "japanese": "일식", "일본": "일식", "일본요리": "일식",
+}
+
+
+def _clean_cuisine(value):
+    text = re.sub(r"\s+", "", str(value or "")).lower()
+    return text if text in CUISINES else _CUISINE_WORDS.get(text, "")
 
 
 def _clean_recipe(raw):
@@ -209,6 +238,7 @@ def _clean_recipe(raw):
     return {
         "title": title,
         "summary": _clean_text(raw.get("summary"), 120),
+        "cuisine": _clean_cuisine(raw.get("cuisine")),
         "servings": max(1, servings),
         "time_minutes": minutes,
         "difficulty": difficulty,
@@ -223,10 +253,10 @@ def parse_recipes(text):
     data = llm.extract_json(text)
     items = data.get("recipes") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        raise llm.ParseError("모델 응답에 recipes 목록이 없습니다.")
+        raise llm.ParseError("모델 응답에 recipes 목록이 없습니다.", llm.snippet(text))
     recipes = [r for r in (_clean_recipe(x) for x in items) if r]
     if not recipes:
-        raise llm.ParseError("모델 응답에서 쓸 수 있는 레시피를 찾지 못했습니다.")
+        raise llm.ParseError("모델 응답에서 쓸 수 있는 레시피를 찾지 못했습니다.", llm.snippet(text))
     return recipes
 
 
@@ -299,8 +329,15 @@ def reject_reason(recipe, options, pantry_names):
         nf = normalize_name(food)
         if len(nf) >= 2 and nf in title and not any(nf in n for n in ing_names):
             return f"제목에 있는 재료({food})가 재료 목록에 없음"
-    if options["max_minutes"] and recipe["time_minutes"] > options["max_minutes"]:
+    if options.get("max_minutes") and recipe["time_minutes"] > options["max_minutes"]:
         return f"조리 시간 {recipe['time_minutes']}분이 {options['max_minutes']}분을 넘음"
+    if options.get("min_minutes") and recipe["time_minutes"] < options["min_minutes"]:
+        return f"조리 시간 {recipe['time_minutes']}분이 {options['min_minutes']}분 미만임"
+    # 요리 종류는 모델이 cuisine 을 밝힌 경우에만 확인한다. 밝히지 않았으면 확인할 수 없어 통과시킨다.
+    if options.get("cuisine") and recipe["cuisine"] and recipe["cuisine"] != options["cuisine"]:
+        return f"요리 종류가 {recipe['cuisine']}이라 {options['cuisine']}이 아님"
+    if options.get("difficulty") and recipe["difficulty"] != options["difficulty"]:
+        return f"난이도가 {DIFFICULTY_KO[recipe['difficulty']]}이라 {DIFFICULTY_KO[options['difficulty']]}이 아님"
     if options["extra"] == "불가" and recipe["missing"]:
         return "가진 재료만 쓰는 조건인데 부족한 재료가 있음"
     if options["extra"] == "소량" and any(not is_seasoning(m) for m in recipe["missing"]):
@@ -313,8 +350,8 @@ def _generate_with_model(model, messages, api_key, post, sleep, on_event):
     """모델 하나로 생성한다. 응답 형식이 깨지면 같은 모델에 1회 다시 요청한다."""
     last_error = None
     for n in range(2):
-        if n:
-            llm.notify(on_event, "parse_retry", model=model)
+        if n:  # 첫 응답이 형식 오류였다. 무엇이 문제였는지 함께 알린다.
+            llm.notify(on_event, "parse_retry", model=model, cause=str(last_error), snippet=getattr(last_error, "snippet", ""))
         text = llm.chat(model, messages, api_key, MAX_TOKENS, post=post, sleep=sleep, on_event=on_event,
                         timeout=TIMEOUT_SEC, extra=EXTRA)
         try:
@@ -325,7 +362,9 @@ def _generate_with_model(model, messages, api_key, post, sleep, on_event):
 
 
 def generate_recipes(ingredients, options, api_key, post=requests.post, sleep=time.sleep, on_event=None):
-    """재료·조건 → 레시피. 돌려주는 값: recipes, excluded[(제목, 이유)], model(마지막 응답 모델), requested.
+    """재료·조건 → 레시피. 돌려주는 값: recipes, excluded[(제목, 이유)], model(마지막 응답 모델), requested, note.
+
+    note 는 일부만 받고 멈춘 이유다(예: 두 번째 요청 중 하루 한도 소진). 문제가 없으면 빈 문자열이다.
 
     모델이 429·사용 불가·형식 오류로 실패하면 FALLBACK_MODELS 를 차례로 시도한다.
     조건에 맞는 레시피가 요청 개수보다 적으면 모자란 만큼 한 번 더 요청한다.
@@ -341,7 +380,7 @@ def generate_recipes(ingredients, options, api_key, post=requests.post, sleep=ti
     models = (TEXT_MODEL, *FALLBACK_MODELS)
     fall_on = (llm.RateLimitedError, llm.ModelUnavailableError, llm.ParseError)
 
-    kept, excluded, seen_titles, used_model = [], [], [], None
+    kept, excluded, seen_titles, used_model, note = [], [], [], None, ""
     for round_no in range(1, MAX_ROUNDS + 1):
         need = count - len(kept)
         if need <= 0:
@@ -352,8 +391,9 @@ def generate_recipes(ingredients, options, api_key, post=requests.post, sleep=ti
             used_model, recipes = llm.run_with_fallback(
                 models, lambda m: _generate_with_model(m, messages, api_key, post, sleep, on_event), on_event, fall_on
             )
-        except llm.RateLimitedError:
-            if kept:  # 이미 받은 것이 있으면 그것만 보여 준다
+        except (llm.RateLimitedError, llm.AllModelsUnavailableError, llm.ParseError) as e:
+            if kept:  # 이미 받은 것이 있으면 그것만 보여 주고, 더 못 받은 이유를 함께 알린다
+                note = f"나머지 레시피는 받지 못했어요. {e}"
                 break
             raise
         for recipe in recipes:
@@ -369,4 +409,4 @@ def generate_recipes(ingredients, options, api_key, post=requests.post, sleep=ti
                 kept.append(recipe)
     kept = kept[:count]
     llm.notify(on_event, "done", model=used_model, count=len(kept), what="레시피 생성")
-    return {"recipes": kept, "excluded": excluded, "model": used_model, "requested": count}
+    return {"recipes": kept, "excluded": excluded, "model": used_model, "requested": count, "note": note}

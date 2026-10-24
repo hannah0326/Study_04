@@ -150,6 +150,163 @@ def test_run_with_fallback_all_failed_raises_friendly_error_with_cause():
     assert events[-1]["next_model"] is None
 
 
+# --- 하루 한도 소진 ---
+DAILY_BODY = {
+    "error": {
+        "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+        "code": 429,
+        "metadata": {
+            "headers": {"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1792713600000"},
+            "limit_source": "openrouter_free_tier_daily",
+        },
+    }
+}
+
+
+def daily_response():
+    return Resp(429, DAILY_BODY)
+
+
+def test_daily_limit_gets_a_specific_message_with_korean_reset_time():
+    events = []
+    with pytest.raises(llm.DailyLimitError) as e:
+        chat(FakePost([daily_response()]), on_event=events.append)
+    msg = str(e.value)
+    assert "50회" in msg and "한국 시각 10월 23일 오전 9시" in msg and "다시 시도해도 같은 오류" in msg
+    assert "잠시 후" not in msg                      # 틀린 안내("잠시 후 다시")를 하지 않는다
+    assert [x["kind"] for x in events] == ["request", "response", "daily_limit"]
+    assert events[-1]["reset"] == "한국 시각 10월 23일 오전 9시"
+
+
+def test_daily_limit_is_not_retried():
+    post = FakePost([daily_response(), ok()])
+    with pytest.raises(llm.DailyLimitError):
+        chat(post)
+    assert len(post.calls) == 1                      # 재시도하지 않는다
+
+
+def test_daily_limit_is_recognized_from_message_only_and_inside_http_200():
+    only_message = Resp(429, {"error": {"message": "Rate limit exceeded: free-models-per-day"}})
+    with pytest.raises(llm.DailyLimitError) as e:
+        chat(FakePost([only_message]))
+    assert "횟수를 모두" in str(e.value) and "한국 시각 오전 9시" in str(e.value)   # 한도 숫자·시각을 모르면 일반 문구
+    inside_200 = Resp(200, {"error": {**DAILY_BODY["error"]}})
+    with pytest.raises(llm.DailyLimitError):
+        chat(FakePost([inside_200]))
+
+
+def test_daily_limit_reads_headers_of_the_response_too():
+    r = Resp(429, {"error": {"message": "free-models-per-day"}})
+    r.headers = {"X-RateLimit-Limit": "50", "X-RateLimit-Reset": "1792713600000"}
+    with pytest.raises(llm.DailyLimitError) as e:
+        chat(FakePost([r]))
+    assert "50회" in str(e.value) and "10월 23일 오전 9시" in str(e.value)
+
+
+def test_ordinary_429_is_still_a_busy_error_that_can_be_retried():
+    other = Resp(429, {"error": {"message": "provider is busy", "metadata": {"limit_source": "provider"}}})
+    post = FakePost([other, other])
+    with pytest.raises(llm.RateLimitedError) as e:
+        chat(post)
+    assert not isinstance(e.value, llm.DailyLimitError) and "잠시 후" in str(e.value)
+    assert len(post.calls) == 2
+
+
+def test_run_with_fallback_stops_at_daily_limit_without_trying_other_models():
+    tried = []
+
+    def attempt(m):
+        tried.append(m)
+        raise llm.DailyLimitError(50, 1792713600000)
+
+    with pytest.raises(llm.DailyLimitError):
+        llm.run_with_fallback(["a", "b", "c"], attempt)
+    assert tried == ["a"]                            # 다른 모델도 같은 한도라 시도해 봐야 소용없다
+
+
+@pytest.mark.parametrize("ms,expected", [
+    (1792713600000, "한국 시각 10월 23일 오전 9시"),
+    (1792717200000, "한국 시각 10월 23일 오전 10시"),
+    (1792762200000, "한국 시각 10월 23일 오후 10시 30분"),   # 오전 9시 + 13시간 30분
+    (1792681200000, "한국 시각 10월 23일 오전 12시"),         # 자정
+    (1792724400000, "한국 시각 10월 23일 오후 12시"),         # 정오
+    (None, "한국 시각 오전 9시"), ("엉뚱", "한국 시각 오전 9시")])
+def test_format_reset_time_is_korean_time(ms, expected):
+    assert llm.format_reset(ms) == expected
+
+
+# --- 모든 모델 종료·형식 오류 ---
+def test_all_models_unavailable_says_so_instead_of_busy():
+    def attempt(m):
+        raise llm.ModelUnavailableError("x")
+
+    with pytest.raises(llm.AllModelsUnavailableError) as e:
+        llm.run_with_fallback(["a", "b"], attempt)
+    msg = str(e.value)
+    assert "모두 사용할 수 없" in msg and "관리자" in msg and "잠시 후" not in msg
+    assert not isinstance(e.value, llm.RateLimitedError)
+
+
+def test_mixed_failures_remain_a_busy_error():
+    errors = {"a": llm.ModelUnavailableError("x"), "b": llm.RateLimitedError("y")}
+
+    def attempt(m):
+        raise errors[m]
+
+    with pytest.raises(llm.RateLimitedError) as e:
+        llm.run_with_fallback(["a", "b"], attempt)
+    assert "잠시 후" in str(e.value)
+
+
+def test_all_models_with_bad_format_says_the_format_was_wrong():
+    def attempt(m):
+        raise llm.ParseError("x")
+
+    with pytest.raises(llm.ParseError) as e:
+        llm.run_with_fallback(["a", "b"], attempt, fall_on=(llm.ParseError,))
+    assert "올바른 형식" in str(e.value)
+
+
+# --- 진행 기록: 응답 시간과 형식 오류 원인 ---
+def test_every_request_reports_status_and_seconds():
+    events = []
+    chat(FakePost([Resp(429), ok()]), on_event=events.append)
+    responses = [e for e in events if e["kind"] == "response"]
+    assert [r["status"] for r in responses] == [429, 200]
+    assert all(isinstance(r["seconds"], float) and r["seconds"] >= 0 for r in responses)
+
+
+@pytest.mark.parametrize("body,part", [
+    ({"choices": [{"message": {"content": ""}}]}, "빈 응답"),
+    ({"choices": []}, "choices"),
+    ({"choices": [{"message": {"content": '{"a": 1'}, "finish_reason": "length"}]}, "잘렸"),
+])
+def test_empty_missing_and_truncated_answers_get_distinct_causes(body, part):
+    with pytest.raises(llm.ParseError) as e:
+        chat(FakePost([Resp(200, body)]))
+    assert part in str(e.value)
+
+
+def test_json_errors_carry_the_beginning_of_the_answer_as_a_snippet():
+    with pytest.raises(llm.ParseError) as e:
+        llm.extract_json("죄송합니다.\n  재료를   찾을 수   없어요")
+    assert "JSON" in str(e.value) and e.value.snippet == "죄송합니다. 재료를 찾을 수 없어요"
+    with pytest.raises(llm.ParseError) as e2:
+        llm.extract_json("{깨진: json}")
+    assert "올바른 JSON" in str(e2.value) and e2.value.snippet.startswith("{깨진")
+    assert len(llm.snippet("가" * 500)) == 60
+
+
+def test_fallback_event_for_bad_format_carries_the_underlying_cause():
+    def attempt(m):
+        raise llm.ParseError("레시피 응답을 해석하지 못했습니다.") from llm.ParseError("모델이 빈 응답을 보냈습니다.", "")
+
+    events = []
+    with pytest.raises(llm.ParseError):
+        llm.run_with_fallback(["a"], attempt, events.append, fall_on=(llm.ParseError,))
+    assert events[0]["reason"] == "parse" and events[0]["cause"] == "모델이 빈 응답을 보냈습니다."
+
+
 # --- JSON 추출 ---
 @pytest.mark.parametrize(
     "text",

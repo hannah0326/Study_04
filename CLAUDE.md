@@ -35,10 +35,13 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python src/test_openrouter.py              
 - 모델: 이미지 기본 `nvidia/nemotron-3.5-super-vl:free`(`recognizer.VISION_MODEL`), 대체 `dots-studio/dots-3-note-preview:free`(`FALLBACK_MODELS`). 텍스트 기본 `nvidia/nemotron-3-ultra-550b-a55b:free`(안정성 우선), 대체 `nemotron-3.5-lightning`(빠르지만 형식 오류·개수 부족이 잦음) → `nemotron-3.5-super-vl` → `poolside/laguna-s-2.1`(`recipe.TEXT_MODEL`·`recipe.FALLBACK_MODELS`).
 - `minimax/minimax-m3.1-flash:free`는 2026-10-22에 무료 기간이 끝나 404를 돌려준다(처음에 가장 빨라 기본 모델로 정했었다). 그래서 이미지 기본을 `nemotron-3.5-super-vl`로 바꿨다. 유료 모델(`minimax/minimax-m3.1-flash`)은 요금이 나가므로 쓰지 않는다. 앱은 404를 "사용 불가"로 보고 재시도 없이 대체 모델로 넘어간다. 무료 모델은 이처럼 하루 만에도 사라질 수 있으므로 모델 이름이 404를 내면 `/api/v1/models`로 다시 조사한다.
 - 텍스트 모델은 추론을 끄고(`reasoning: {"enabled": false}`) 부른다. 켜면 66초 이상 걸리고 토큰을 추론에 다 써서 응답이 잘린다. 추론을 끌 수 없는 모델(`recursive/flint`)은 400이 나므로 쓰지 않는다. 모델이 준 보유 재료·알레르기 준수·시간은 믿지 않고 `recipe.reject_reason()`이 다시 확인한다. 화면에 쓰는 모델 글자는 `md_safe()`로 이스케이프한다.
+- 레시피 조건: 요리 종류(한식·양식·중식·일식), 난이도(초급·중급·고급 = easy·medium·hard), 조리 시간(제한 없음·15분 이내·30분 이내·30분 이상), 인원수, 알레르기, 식단 제한, 추가 재료 정책, 개수. 조리 시간은 `app.py`의 `TIME_CHOICES`가 (이름, 최소 분, 최대 분)으로 풀어 `recipe`에 `min_minutes`·`max_minutes`로 넘긴다("이상"=최소, "이내"=최대, 둘을 함께 주면 최대 우선). 요리 종류·난이도·시간은 모델 답을 믿지 않고 `recipe.reject_reason()`이 다시 확인한다. 모델이 `cuisine`을 밝히지 않으면 확인할 수 없어 통과시킨다.
 - 2단계는 생성이 끝나면 `st.rerun()`으로 화면을 다시 그린다(단추 이름과 결과를 함께 갱신). 실패하면 이전 결과를 지우고 `recipe_error`를 보여 준다. 재료를 다시 인식·확정하면 `clear_recipes()`로 레시피를 지운다.
 - API 키 조회 순서: 앱은 `st.secrets` → 환경변수 → 프로젝트 루트 `.env`(`recognizer.get_api_key()`). 키 값은 화면·로그·오류 문구에 출력하지 않는다. `.env`와 `.streamlit/secrets.toml`은 git에서 제외된다.
 - 업로드 이미지는 검증 후 긴 변 1024px·약 300KB 이하 JPEG로 줄여(`prepare_image`) base64 data URL로 보낸다. 이미지는 저장하지 않는다. 업로드 한도 10MB는 `.streamlit/config.toml`의 `maxUploadSize`가 담당한다.
 - `max_tokens`는 2000이다. Nemotron VL 같은 추론형 모델은 답하기 전에 추론에 토큰을 많이 쓰므로, 300처럼 작게 잡으면 응답이 중간에 끊긴다.
+- **실패 원인별 안내(`llm.py`):** 하루 무료 한도 소진은 `DailyLimitError`(429 본문의 `limit_source == "openrouter_free_tier_daily"` 또는 메시지 `free-models-per-day`로 판별, 한도 횟수·초기화 시각은 `X-RateLimit-Limit`·`X-RateLimit-Reset`에서 읽어 한국 시각으로 안내)로 올리고 재시도도 대체 모델도 시도하지 않는다. 모든 모델이 사용 불가면 `AllModelsUnavailableError`("AI 모델을 모두 사용할 수 없어요… 관리자에게"), 모두 형식 오류면 `ParseError`("올바른 형식으로 답하지 못했어요"), 그 밖에는 `RateLimitedError`("요청이 몰려 있습니다")다. 분당 한도는 아직 구분하지 않는다.
+- **진행 기록:** 요청마다 `response` 이벤트(상태, 걸린 초)와 마지막 `⏱ 총 N초`가 남고, 형식 오류 재요청에는 원인(`cause`)과 응답 앞부분(`snippet`, 60자)이 붙는다. 원인은 빈 응답·`choices` 없음·응답 잘림(`finish_reason == "length"`)·JSON 없음·잘못된 JSON으로 구분된다.
 - 모델이 형식에 어긋나게 답하면 같은 모델에 1회 다시 요청한다. 429·5xx는 2초 뒤 한 번만 재시도하고, 그래도 실패하거나 모델이 없으면(403·404·410) `recognizer.FALLBACK_MODELS`를 차례로 시도한다. 401(키 문제)은 대체하지 않는다. 진입점은 `recognize_detailed()`이며 사용한 모델과 용량 변화를 함께 돌려준다. `tests/`가 검증한다.
 - 이미지 모델은 같은 이미지로 직접 시험한 응답 시간과 사용자가 실제 냉장고 사진으로 확인한 정확도로 정했다(2026-10-22, 모델당 1회: minimax 7초(종료), nemotron-3.5-super-vl 19초, dots 24초). 모델 가용성이 바뀌면 `/api/v1/models`에서 `:free` + 이미지 입력 모델을 다시 조사해 갱신한다. 제외한 모델: `nemotron-3-nano-omni`(175초), `thinkingmachines/inkling*`(agentic 전용이라 403), `google/gemma-4-*`(공유 풀 429). `dots`는 추론에 토큰을 많이 써서 `max_tokens`가 작으면 답이 잘려 파싱에 실패할 수 있다.
 - 식재료가 아닌 단순 도형 이미지는 모델이 빈 목록을 돌려준다. 정상 동작이며 앱은 "찾지 못함" 안내를 보여 준다.
@@ -53,9 +56,23 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python src/test_openrouter.py              
 - `google/gemma-4-26b-a4b-it:free`, `google/gemma-4-31b-it:free`는 Google AI Studio 공유 풀 한도 때문에 반복적으로 HTTP 429가 났다. 키나 코드 문제가 아니다.
 - `nvidia/nemotron-3-super-120b-a12b:free`는 Nvidia 쪽에서 404(함수 없음)가 났다.
 - 429·404는 제공사 오류이고 인증 오류(401)와 구분된다.
+- 429가 계정의 하루 무료 한도(50회) 때문이면 어떤 `:free` 모델로 바꿔도 같은 오류가 나고, 한국 시각 오전 9시(UTC 자정)에 초기화된다. 실제 호출 점검과 모델 비교 시험이 한도를 빨리 쓰므로 필요할 때만 한다.
 
 ## 저장소 관례
 
 - 새 파일에는 KST(UTC+9) 기준 작성 일시를 주석으로 표시한다.
 - 저장소에 올라가는 텍스트(주석, 커밋 메시지, 문서)는 한국어로 쓴다.
 - `.gitignore`는 `.env`, `.env.*`(`.env.example` 제외), `.streamlit/secrets.toml`, `.venv/`, 캐시, macOS의 `.DS_Store`를 제외한다.
+
+## 실행 시 확인 사항
+
+앱은 OpenRouter API로 실제 AI 모델을 불러 냉장고 사진의 식재료를 인식하고(1단계) 레시피를 생성한다(2단계). 실제 모델을 실행했으면 **매번** API가 정확하게 작동했는지, AI 모델이 문제 없이 실행되었는지를 점검하고, 문제가 있었다면 무엇이었는지 보고한다.
+
+- **API 동작**: 응답한 모델(기본/대체), 시도별 결과(200·429·404·형식 오류), 재시도와 대체 모델 전환 여부, 소요 시간
+- **결과 품질**: JSON 해석 성공 여부, 재료명 깨짐, 정답을 아는 사진이면 인식률, 레시피의 알레르기·식단·시간·난이도·요리 종류·추가 재료 조건 준수
+- **실패했을 때**: 원인(예: 하루 한도 소진, 모델 서비스 종료, 형식 오류)과 사용자에게 보인 안내 문구. 안내가 원인과 맞는지도 확인한다.
+
+점검 방법:
+
+- 앱 화면의 "진행 기록"(이미지 인식·레시피 각각)에서 모델, 상태, 전환 여부를 확인하고 시간은 직접 잰다.
+- 무료 한도(계정당 하루 50회, 한국 시각 오전 9시 초기화)를 지키기 위해 실제 호출은 점검이 필요할 때만 하고, 코드 검증은 가짜 응답 테스트(`pytest`)로 한다. 429 응답에 `X-RateLimit-Remaining: 0`이 있으면 모델 문제가 아니라 하루 한도 소진이다.
