@@ -10,6 +10,7 @@ SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, SRC)
 import llm  # noqa: E402
 import recipe  # noqa: E402
+import recognizer  # noqa: E402
 
 APP = os.path.join(SRC, "app.py")
 CONFIRMED = [{"name": "달걀", "quantity": "6개", "confidence": "high"}, {"name": "양배추", "quantity": "", "confidence": "high"}]
@@ -229,4 +230,113 @@ def test_rate_limit_blocks_generation_without_calling_the_model(app, monkeypatch
     app.session_state["calls"] = [_t.time()] * 5
     app.run()
     button(app, "레시피 생성").click().run()
-    assert called == [] and any("너무 잦습니다" in w.value for w in app.warning)
+    assert called == [] and any("너무 잦습니다" in e.value for e in app.error)
+    app.run()   # 다른 조작으로 화면이 다시 그려져도 실패 표시가 남아 있어야 한다
+    assert any("너무 잦습니다" in e.value for e in app.error)
+
+
+# --- 실패는 정직하게 화면에 표시한다 ---
+def png_bytes():
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (120, 80), (200, 30, 30)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def recognize_click(at):
+    at.file_uploader[0].upload("fridge.png", png_bytes(), "image/png")
+    at.run()
+    [b for b in at.button if b.label == "식재료 인식"][0].click().run()
+
+
+@pytest.fixture
+def photo_app():
+    return AppTest.from_file(APP, default_timeout=30)
+
+
+def test_recipe_failure_hides_the_previous_result_and_keeps_the_message_across_reruns(app, monkeypatch):
+    app.session_state["recipe_result"] = fake_result(fake_recipe("옛 레시피"))
+    monkeypatch.setattr(recipe, "generate_recipes", lambda *a, **k: (_ for _ in ()).throw(llm.RateLimitedError(llm.MSG_BUSY)))
+    app.run()
+    button(app, "다시 생성").click().run()
+    assert "recipe_result" not in app.session_state and "옛 레시피" not in texts(app)
+    app.run()
+    app.run()                                                 # 화면이 여러 번 다시 그려져도
+    assert any("레시피 생성에 실패했어요" in e.value for e in app.error)
+    assert not any("옛 레시피" in str(m.value) for m in app.markdown)
+
+
+def test_unexpected_error_during_recipes_is_reported_as_a_failure_not_a_crash(app, monkeypatch):
+    def boom(*a, **k):
+        raise KeyError("secret-detail-/home/user/path")
+
+    monkeypatch.setattr(recipe, "generate_recipes", boom)
+    app.run()
+    button(app, "레시피 생성").click().run()
+    assert not app.exception                                   # 앱이 거친 오류 화면으로 죽지 않는다
+    shown = " ".join(e.value for e in app.error)
+    assert "레시피 생성에 실패했어요" in shown and "예상하지 못한 오류" in shown and "KeyError" in shown
+    assert "secret-detail" not in shown                       # 오류 내용(경로 등)은 화면에 내지 않는다
+    assert any(line.startswith("❌") for line in app.session_state["recipe_log"])
+    assert "recipe_result" not in app.session_state
+
+
+def test_recognition_failure_message_stays_visible_after_other_interactions(photo_app, monkeypatch):
+    def boom(*a, **k):
+        raise llm.RateLimitedError(llm.MSG_BUSY)
+
+    monkeypatch.setattr(recognizer, "recognize_detailed", boom)
+    photo_app.session_state["confirmed"] = CONFIRMED          # 이전 결과가 있던 상태에서 실패해도
+    photo_app.session_state["rows"] = [{"id": 0, "name": "달걀", "quantity": "", "confidence": "high"}]
+    photo_app.session_state["next_id"] = 1
+    photo_app.run()
+    recognize_click(photo_app)
+    assert not photo_app.exception
+    assert any("사진 인식에 실패했어요" in e.value and "이전 인식 결과는 보여 주지 않습니다" in e.value for e in photo_app.error)
+    assert "rows" not in photo_app.session_state and "confirmed" not in photo_app.session_state
+    assert not [b for b in photo_app.button if b.label == "레시피 생성"]   # 이전 재료로 레시피를 만들 수 없다
+    photo_app.toggle[0].set_value(True).run()                  # 다른 조작으로 다시 그려져도
+    photo_app.toggle[0].set_value(False).run()
+    assert any("사진 인식에 실패했어요" in e.value for e in photo_app.error)
+
+
+def test_recognition_unexpected_error_is_reported(photo_app, monkeypatch):
+    monkeypatch.setattr(recognizer, "recognize_detailed", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("x")))
+    photo_app.run()
+    recognize_click(photo_app)
+    assert not photo_app.exception
+    shown = " ".join(e.value for e in photo_app.error)
+    assert "사진 인식에 실패했어요" in shown and "예상하지 못한 오류" in shown and "ZeroDivisionError" in shown
+    assert "rows" not in photo_app.session_state
+
+
+def test_recognition_rate_limit_is_a_visible_failure_that_stays(photo_app, monkeypatch):
+    import time as _t
+    called = []
+    monkeypatch.setattr(recognizer, "recognize_detailed", lambda *a, **k: called.append(1))
+    photo_app.session_state["calls"] = [_t.time()] * 5
+    photo_app.run()
+    recognize_click(photo_app)
+    assert called == []
+    photo_app.run()
+    assert any("너무 잦습니다" in e.value for e in photo_app.error)
+
+
+def test_a_new_successful_recognition_clears_the_old_failure_message(photo_app, monkeypatch):
+    state = {"fail": True}
+
+    def flaky(*a, on_event=None, **k):
+        if state["fail"]:
+            raise llm.RateLimitedError(llm.MSG_BUSY)
+        return {"items": [{"name": "달걀", "quantity": "1개", "confidence": "high"}], "model": recognizer.VISION_MODEL,
+                "original_bytes": 1000, "sent_bytes": 500}
+
+    monkeypatch.setattr(recognizer, "recognize_detailed", flaky)
+    photo_app.run()
+    recognize_click(photo_app)
+    assert any("사진 인식에 실패했어요" in e.value for e in photo_app.error)
+    state["fail"] = False
+    [b for b in photo_app.button if b.label == "식재료 인식"][0].click().run()
+    assert not photo_app.error                                 # 성공하면 지난 실패 표시는 사라진다
+    assert photo_app.session_state["rows"][0]["name"] == "달걀"

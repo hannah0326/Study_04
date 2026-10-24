@@ -1,17 +1,24 @@
 # 작성: 2026-10-22 12:23 KST
 # 1·2단계 화면: 냉장고 사진 업로드 → 식재료 인식 → 수정·확정 → 조건 선택 → 레시피 생성
-import re
+import logging
 import time
 
 import streamlit as st
 
+import account_ui
 import llm
 import recipe
 import recognizer
 import rows as rows_mod
+import services
+from ui_common import (DIFFICULTY_LABEL, TIME_CHOICES, md_safe, recipe_caption, render_recipe_body,
+                       render_recipe_summary, unexpected_message)
 
 RATE_LIMIT_COUNT = 5
 RATE_LIMIT_WINDOW_SEC = 60
+TOO_OFTEN = "요청이 너무 잦습니다. 1분 뒤에 다시 시도해 주세요."
+
+logger = logging.getLogger("fridge_app")
 
 
 def get_key():
@@ -108,10 +115,7 @@ def add_row():
     st.session_state["next_id"] = row_id + 1
 
 
-DIFFICULTY_LABEL = recipe.DIFFICULTY_KO  # easy/medium/hard → 초급/중급/고급
-# 조리 시간 선택지: (이름, 최소 분, 최대 분). "이상"은 최소 시간, "이내"는 최대 시간이다.
-TIME_CHOICES = (("제한 없음", None, None), ("15분 이내", None, 15), ("30분 이내", None, 30), ("30분 이상", 30, None))
-RECIPE_STATE_KEYS = ("recipe_result", "recipe_error", "recipe_log")
+RECIPE_STATE_KEYS = ("recipe_result", "recipe_error", "recipe_log", "save_notice", "pending_save")
 
 
 def clear_recipes():
@@ -120,26 +124,26 @@ def clear_recipes():
         st.session_state.pop(key, None)
 
 
-def md_safe(text):
-    """모델이 준 글자를 마크다운·링크·수식으로 해석하지 않도록 이스케이프한다. 모델 출력은 믿지 않는다."""
-    return re.sub(r"([\\`*_{}\[\]()#+!|<>~$])", r"\\\1", str(text))
-
-
 def recipe_options():
-    """레시피 조건 입력 위젯을 그리고 선택값을 돌려준다."""
+    """레시피 조건 입력 위젯을 그리고 선택값을 돌려준다. 로그인했으면 프로필 값이 기본값으로 채워진다."""
+    account_ui.apply_profile_defaults(st.session_state.get("user"))
+    ss = st.session_state
     st.selectbox("요리 종류", [None, *recipe.CUISINES], format_func=lambda v: "제한 없음" if v is None else v, key="opt_cuisine")
     st.selectbox(
         "난이도", [None, *recipe.DIFFICULTIES],
         format_func=lambda v: "제한 없음" if v is None else DIFFICULTY_LABEL[v], key="opt_difficulty",
     )
     st.selectbox("조리 시간", [c[0] for c in TIME_CHOICES], key="opt_time")
-    st.number_input("인원수", min_value=1, max_value=10, value=2, step=1, key="opt_servings")
+    # 프로필 값을 상태에 미리 넣어 둔 위젯에는 value 를 함께 주지 않는다(Streamlit 이 둘 다 주면 경고한다).
+    number_kwargs = {} if "opt_servings" in ss else {"value": 2}
+    st.number_input("인원수", min_value=1, max_value=10, step=1, key="opt_servings", **number_kwargs)
     st.multiselect(
-        "알레르기", list(recipe.ALLERGEN_TERMS), accept_new_options=True, key="opt_allergies",
-        placeholder="없음 (직접 입력도 가능)",
+        "알레르기", list(dict.fromkeys([*recipe.ALLERGEN_TERMS, *ss.get("opt_allergies", [])])),
+        accept_new_options=True, key="opt_allergies", placeholder="없음 (직접 입력도 가능)",
     )
     st.multiselect(
-        "식단 제한", ["채식", "비건", "페스코"], accept_new_options=True, key="opt_diet", placeholder="없음",
+        "식단 제한", list(dict.fromkeys(["채식", "비건", "페스코", *ss.get("opt_diet", [])])),
+        accept_new_options=True, key="opt_diet", placeholder="없음",
     )
     st.radio(
         "추가 재료 사용", recipe.EXTRA_CHOICES, index=1, horizontal=True, key="opt_extra",
@@ -164,17 +168,24 @@ def generate_recipes_clicked(confirmed, options):
     """레시피 생성 단추를 눌렀을 때. 진행 단계를 보여 주고 결과나 실패를 session_state 에 남긴다."""
     clear_recipes()
     if rate_limited():
-        st.warning("요청이 너무 잦습니다. 1분 뒤에 다시 시도해 주세요.")
+        st.session_state["recipe_error"] = TOO_OFTEN  # 이어지는 화면 그리기에서 실패로 보여 준다
         return
     log = []
     st.session_state["recipe_log"] = log
     on_event, finish = start_progress("레시피를 만드는 중입니다. 최대 1~2분 걸릴 수 있어요.", log)
+
+    def fail(message):
+        log.append(f"❌ {message}")
+        st.session_state["recipe_error"] = message
+        finish("레시피 생성 실패", "error")
+
     try:
         result = recipe.generate_recipes(confirmed, options, get_key(), on_event=on_event)
     except llm.ServiceError as e:
-        log.append(f"❌ {e}")
-        st.session_state["recipe_error"] = str(e)
-        finish("레시피 생성 실패", "error")
+        fail(str(e))
+    except Exception as e:  # noqa: BLE001 - 예상하지 못한 오류도 숨기지 않고 실패했다고 알린다
+        logger.exception("레시피 생성 중 예상하지 못한 오류")
+        fail(unexpected_message(e))
     else:
         st.session_state["recipe_result"] = result
         finish(f"레시피 {len(result['recipes'])}개 완료", "complete")
@@ -184,7 +195,11 @@ def generate_recipes_clicked(confirmed, options):
 
 def render_recipes(result):
     recipes = result["recipes"]
+    user = st.session_state.get("user")
+    repo, _ = services.get_repository() if user else (None, None)
+    saved = account_ui.saved_fingerprints(repo, user)
     st.subheader(f"추천 레시피 {len(recipes)}개")
+    account_ui.show_save_notice()
     if result["model"] and result["model"] != recipe.TEXT_MODEL:
         st.info(f"기본 모델을 쓸 수 없어 대체 모델({result['model']})로 만들었습니다. 내용을 꼼꼼히 확인해 주세요.")
     if not recipes:
@@ -196,21 +211,11 @@ def render_recipes(result):
     for i, r in enumerate(recipes):
         with st.container(border=True):
             st.markdown(f"**{i + 1}. {md_safe(r['title'])}**")
-            lack = "부족한 재료 없음" if not r["missing"] else f"부족한 재료 {len(r['missing'])}개"
-            kind = f"{r['cuisine']} · " if r.get("cuisine") else ""
-            st.caption(f"{kind}⏱ {r['time_minutes']}분 · {DIFFICULTY_LABEL[r['difficulty']]} · {r['servings']}인분 · {lack}")
-            if r["summary"]:
-                st.write(md_safe(r["summary"]))
-            if r["missing"]:
-                st.markdown(" ".join(f":red-badge[🛒 {md_safe(m)}]" for m in r["missing"]))
+            st.caption(recipe_caption(r))
+            render_recipe_summary(r)
             with st.expander("자세히 보기", key=f"recipe_detail_{i}"):
-                st.markdown("**재료**")
-                for ing in r["ingredients"]:
-                    mark = "✅" if ing["have"] else "🛒"
-                    st.markdown(f"- {mark} {md_safe(ing['name'])} {md_safe(ing['amount'])}")
-                st.markdown("**만드는 법**")
-                for n, step in enumerate(r["steps"], 1):
-                    st.markdown(f"{n}\\. {md_safe(step)}")
+                render_recipe_body(r)
+            account_ui.save_controls(i, r, user, repo, saved)
     if result["excluded"]:
         with st.expander(f"조건 때문에 제외한 레시피 {len(result['excluded'])}개", key="recipe_excluded"):
             for title, reason in result["excluded"]:
@@ -247,6 +252,16 @@ div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 
 
 st.set_page_config(page_title="냉장고 재료 인식", page_icon="🧊")
 st.markdown(ONE_LINE_CSS, unsafe_allow_html=True)
+
+# 3단계: 로그인 상태를 확인하고 메뉴를 그린다. 저장소(DB)에 연결하지 못해도 이 메인 화면(1·2단계)은 그대로 쓸 수 있다.
+repo, repo_error = services.get_repository()
+user = account_ui.current_user(repo)
+menu = account_ui.render_sidebar(user, repo_error)
+if menu != account_ui.MENU_MAIN:
+    account_ui.render_page(menu, repo, repo_error, user)
+    st.stop()
+account_ui.apply_pending_save(user)  # 저장하려다 로그인하러 갔다면 돌아온 지금 이어서 저장한다
+
 st.title("🧊 냉장고 재료 인식")
 st.caption("냉장고 사진을 올리면 안에 있는 식재료를 찾아 드립니다.")
 
@@ -260,16 +275,24 @@ if source is not None:
 
 just_ran = False
 if st.button("식재료 인식", type="primary", disabled=source is None):
+    # 새로 인식하면 이전 결과는 이번 사진의 결과가 아니므로 모두 지운다. 실패해도 이전 결과가 남아 보이지 않게 한다.
     st.session_state.pop("confirmed", None)
     st.session_state.pop("rows", None)
     st.session_state.pop("run_info", None)
+    st.session_state.pop("recognize_error", None)
     clear_recipes()
     if rate_limited():
-        st.warning("요청이 너무 잦습니다. 1분 뒤에 다시 시도해 주세요.")
+        st.session_state["recognize_error"] = TOO_OFTEN
     else:
         log = []
         st.session_state["progress_log"] = log
         on_event, finish = start_progress("사진을 분석하는 중입니다. 최대 1~2분 걸릴 수 있어요.", log)
+
+        def fail(message):
+            st.session_state.pop("rows", None)
+            st.session_state["recognize_error"] = message
+            log.append(f"❌ {message}")
+            finish("인식 실패", "error")
 
         try:
             result = recognizer.recognize_detailed(source.getvalue(), get_key(), on_event=on_event)
@@ -282,10 +305,14 @@ if st.button("식재료 인식", type="primary", disabled=source is None):
             finish(f"인식 완료 ({len(result['items'])}개)", "complete")
             just_ran = True
         except recognizer.RecognitionError as e:
-            st.session_state.pop("rows", None)
-            log.append(f"❌ {e}")
-            finish("인식 실패", "error")
-            st.error(str(e))
+            fail(str(e))
+        except Exception as e:  # noqa: BLE001 - 예상하지 못한 오류도 숨기지 않고 실패했다고 알린다
+            logger.exception("사진 인식 중 예상하지 못한 오류")
+            fail(unexpected_message(e))
+
+# 실패 메시지는 다음 인식을 누를 때까지 화면에 남긴다. (다른 것을 조작해 화면이 다시 그려져도 사라지지 않는다)
+if "recognize_error" in st.session_state:
+    st.error(f"❌ 사진 인식에 실패했어요. {st.session_state['recognize_error']} 이전 인식 결과는 보여 주지 않습니다.")
 
 # 새로 실행하지 않은 화면(표 수정 등)에서도 직전 진행 기록을 볼 수 있게 한다.
 if not just_ran and st.session_state.get("progress_log"):
@@ -316,14 +343,14 @@ if "rows" in st.session_state:
     for row in rows_state:
         c_warn, c_name, c_qty, c_del = st.columns(LINE, vertical_alignment="center")
         c_warn.write("⚠️" if row["confidence"] == "low" else "")
-        c_name.text_input(
-            "재료 이름", value=row["name"], key=rows_mod.name_key(row["id"]),
-            label_visibility="collapsed", placeholder="재료 이름",
-        )
-        c_qty.text_input(
-            "수량", value=row["quantity"], key=rows_mod.qty_key(row["id"]),
-            label_visibility="collapsed", placeholder="예: 2개",
-        )
+        # 다른 메뉴로 갔다 오면 Streamlit 이 이 화면에 없던 위젯의 값을 지운다. 편집한 값을 행에도 기억해 두었다가,
+        # 위젯 값이 없을 때만 그 값으로 채운다. (value 를 매번 바꿔 주면 위젯이 다시 만들어지므로 상태에 미리 넣는다)
+        name_key, qty_key = rows_mod.name_key(row["id"]), rows_mod.qty_key(row["id"])
+        st.session_state.setdefault(name_key, row["name"])
+        st.session_state.setdefault(qty_key, row["quantity"])
+        c_name.text_input("재료 이름", key=name_key, label_visibility="collapsed", placeholder="재료 이름")
+        c_qty.text_input("수량", key=qty_key, label_visibility="collapsed", placeholder="예: 2개")
+        row["name"], row["quantity"] = st.session_state[name_key], st.session_state[qty_key]
         c_del.button("🗑", key=f"del_{row['id']}", on_click=delete_row, args=(row["id"],), help="이 재료 삭제")
     st.button("＋ 재료 추가", on_click=add_row)
 
