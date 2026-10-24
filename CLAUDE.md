@@ -64,6 +64,8 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python src/test_openrouter.py              
 - DB 접속은 Supabase **Session pooler(포트 5432)**를 쓴다(Transaction pooler 6543은 쓰지 않음). 비밀번호에 `*`·`!`·`@` 같은 문자가 있으면 URL 인코딩한다. 개발 중에도 SQLite로 대체하지 않는다. DB가 없거나 끊겨도 1·2단계는 동작하고 계정 기능에만 안내가 나온다.
 - 테스트는 `tests/conftest.py`가 모든 테스트의 저장소를 메모리로 바꿔 끼운다(실수로 실제 DB에 닿지 않게). 실제 Postgres 시험은 `RUN_LIVE_DB=1`일 때만 임시 스키마를 만들어 돌리고 끝나면 지운다: `RUN_LIVE_DB=1 .venv/Scripts/python -m pytest tests/test_repository.py -q`.
 - 위젯이 그려지지 않는 메뉴로 가면 그 위젯의 `session_state` 값이 사라진다. 그래서 식재료 행은 값을 `rows`에 되써 두고 메뉴를 오가도 유지한다.
+- **배포(Streamlit Community Cloud):** 저장소 `hannah0326/Study_04`, 브랜치 `main`, 파일 `src/app.py`, Python 3.12. 주소는 `https://study04-bbwgqssengm8wappf5ylrt.streamlit.app`이다. Secrets는 최상위 `OPENROUTER_API_KEY`·`DATABASE_URL`을 먼저 쓰고 `[auth]`를 맨 뒤에 둔다. 값은 모두 큰따옴표로 감싼다(따옴표가 빠지면 "Invalid format: please enter valid TOML"이 뜬다). `[auth]`의 `redirect_uri`는 배포 주소의 `/oauth2callback`이고, 구글 콘솔의 승인된 리디렉션 URI에 로컬 주소와 함께 등록해야 한다(빠지면 `redirect_uri_mismatch`). 반영에 몇 분 걸린다.
+- 구글 로그인에는 `Authlib`만으로 부족하고 `httpx`가 필요하다(없으면 `/auth/login`이 Internal Server Error). `requirements.txt`에 들어 있다.
 - 요청 제한은 IP가 아니라 세션 기준이다(Streamlit에서 IP를 안정적으로 얻기 어려움).
 - 무료 배포 서버의 디스크는 영구 저장소가 아니다. 그래서 3단계 저장은 외부 DB(Supabase)를 쓴다.
 
